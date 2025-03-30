@@ -134,7 +134,24 @@ case class OptimizeTableCommand(
 )(val zOrderBy: Seq[UnresolvedAttribute])
   extends OptimizeTableCommandBase with RunnableCommand with UnaryNode {
 
+  override lazy val metrics: Map[String, SQLMetric] = optimizeSqlMetrics
+
+  @transient private lazy val sc: SparkContext = SparkContext.getOrCreate()
+
   override val otherCopyArgs: Seq[AnyRef] = zOrderBy :: Nil
+
+  private val optimizeSqlMetrics: Map[String, SQLMetric] = Map(
+    "numAddedFiles" -> createMetric(sc, "total number of files added"),
+    "numAddedBytes" -> createMetric(sc, "total number of bytes added."),
+    "numRemovedFiles" -> createMetric(sc, "total number of files removed."),
+    "numRemovedBytes" -> createMetric(sc, "total number of bytes removed."),
+    "numDeletionVectorsRemoved" ->
+      createMetric(sc, "total number of deletion vectors removed"),
+    "numDeletionVectorRowsRemoved" ->
+      createMetric(sc, "total number of deletion vector rows removed"),
+    "numDeletionVectorBytesRemoved" ->
+      createMetric(sc, "total number of bytes of removed deletion vectors")
+  )
 
   override protected def withNewChildInternal(newChild: LogicalPlan): OptimizeTableCommand =
     copy(child = newChild)(zOrderBy)
@@ -171,14 +188,18 @@ case class OptimizeTableCommand(
     validateZorderByColumns(sparkSession, txn, zOrderBy)
     val zOrderByColumns = zOrderBy.map(_.name).toSeq
 
-    new OptimizeExecutor(
+    val rows =
+      new OptimizeExecutor(
       sparkSession,
       txn,
       partitionPredicates,
       zOrderByColumns,
       isAutoCompact = false,
       optimizeContext
-    ).optimize()
+    ).optimize(optimizeSqlMetrics)
+
+    sendDriverMetrics(sparkSession, optimizeSqlMetrics)
+    rows
   }
 }
 
@@ -251,7 +272,7 @@ class OptimizeExecutor(
     }
   }
 
-  def optimize(): Seq[Row] = {
+  def optimize(sqlMetrics: Map[String, SQLMetric] = Map.empty): Seq[Row] = {
     recordDeltaOperation(txn.deltaLog, "delta.optimize") {
       val minFileSize = optimizeContext.minFileSize.getOrElse(
         sparkSession.sessionState.conf.getConf(DeltaSQLConf.DELTA_OPTIMIZE_MIN_FILE_SIZE))
@@ -282,6 +303,7 @@ class OptimizeExecutor(
       val removedDVs = filesToProcess.filter(_.deletionVector != null).map(_.deletionVector).toSeq
       if (addedFiles.size > 0) {
         val metrics = createMetrics(sparkSession.sparkContext, addedFiles, removedFiles, removedDVs)
+        metrics.foreach{ case (k, v) => sqlMetrics.get(k).foreach(_.set(v.value)) }
         commitAndRetry(txn, getOperation(), updates, metrics) { newTxn =>
           val newPartitionSchema = newTxn.metadata.partitionSchema
           val candidateSetOld = candidateFiles.map(_.path).toSet
@@ -472,6 +494,7 @@ class OptimizeExecutor(
       metrics: Map[String, SQLMetric])(f: OptimisticTransaction => Boolean): Unit = {
     try {
       txn.registerSQLMetrics(sparkSession, metrics)
+      sendDriverMetrics(sparkSession, metrics)
       txn.commit(actions, optimizeOperation,
         RowTracking.addPreservedRowTrackingTagIfNotSet(txn.snapshot))
     } catch {
