@@ -24,6 +24,7 @@ import scala.collection.mutable
 
 import org.apache.spark.sql.delta.ClassicColumnConversions._
 import org.apache.spark.sql.delta.DataFrameUtils
+import org.apache.spark.sql.delta.NoMapping
 import org.apache.spark.sql.delta.skipping.clustering.{ClusteredTableUtils, ClusteringColumnInfo}
 import org.apache.spark.sql.delta.skipping.clustering.temp.ClusterBySpec
 import org.apache.spark.sql.delta._
@@ -228,8 +229,27 @@ class DeltaTableV2 private(
 
   override def schema(): StructType = tableSchema
 
+  /**
+   * Reports the partitioning scheme of this Delta table to Spark.
+   *
+   * This method is used by Spark's query optimizer for various optimizations including
+   * storage-partitioned joins, where joins on partition keys can avoid shuffle operations.
+   *
+   * Handles column mapping by using physical column names when column mapping is enabled.
+   *
+   * @return Array of partition transforms
+   */
   override def partitioning(): Array[Transform] = {
-    initialSnapshot.metadata.partitionColumns.map { col =>
+    val metadata = initialSnapshot.metadata
+
+    // Use physical column names if column mapping is enabled
+    val partitionCols = if (metadata.columnMappingMode != NoMapping) {
+      metadata.physicalPartitionColumns
+    } else {
+      metadata.partitionColumns
+    }
+
+    partitionCols.map { col =>
       new IdentityTransform(new FieldReference(Seq(col)))
     }.toArray
   }
