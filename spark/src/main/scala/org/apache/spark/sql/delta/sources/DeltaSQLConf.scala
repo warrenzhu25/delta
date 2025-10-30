@@ -1748,6 +1748,17 @@ trait DeltaSQLConfBase {
       .booleanConf
       .createWithDefault(true)
 
+  val PRESERVE_DATA_GROUPING =
+    buildConf("planning.preserveDataGrouping")
+      .doc(
+        """When true, Delta will report physical partitioning information to Spark's query
+          |optimizer to enable storage-partitioned joins. This eliminates unnecessary shuffles
+          |when joining tables on their partition columns, significantly improving performance
+          |for partition-aware joins. Requires spark.sql.sources.v2.bucketing.enabled=true.
+          |""".stripMargin)
+      .booleanConf
+      .createWithDefault(false)
+
   val GENERATED_COLUMN_ALLOW_NULLABLE =
     buildConf("generatedColumn.allowNullableIngest.enabled")
       .internal()
