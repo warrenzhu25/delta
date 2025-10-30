@@ -34,6 +34,7 @@ import org.apache.spark.sql.delta.metering.DeltaLogging
 import org.apache.spark.sql.delta.sources.{DeltaDataSource, DeltaSourceUtils}
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.sources.DeltaSQLConf.ENABLE_TABLE_REDIRECT_FEATURE
+import org.apache.spark.sql.delta.sources.v2.DeltaScanBuilder
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.sql.{DataFrame, Dataset, SaveMode, SparkSession}
@@ -48,6 +49,7 @@ import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
 import org.apache.spark.sql.connector.catalog.TableCapability._
 import org.apache.spark.sql.connector.catalog.V1Table
 import org.apache.spark.sql.connector.expressions._
+import org.apache.spark.sql.connector.read.ScanBuilder
 import org.apache.spark.sql.connector.write.{LogicalWriteInfo, SupportsDynamicOverwrite, SupportsOverwrite, SupportsTruncate, V1Write, WriteBuilder}
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.datasources.{LogicalRelation, LogicalRelationShims}
@@ -228,6 +230,25 @@ class DeltaTableV2 private(
   }
 
   override def schema(): StructType = tableSchema
+
+  /**
+   * Creates a scan builder for reading this Delta table.
+   *
+   * NOTE: This method would enable DataSource V2 read operations with SPJ support,
+   * but the Table interface in this Spark version doesn't support newScanBuilder.
+   * Full SPJ implementation requires either:
+   * 1. Spark version with SupportsRead trait (3.4+)
+   * 2. Custom catalog integration
+   * 3. Runtime plan transformation
+   *
+   * See STORAGE_PARTITION_JOIN_PHASE2_NOTES.md for details.
+   *
+   * @param options Read options
+   * @return A DeltaScanBuilder for constructing scans
+   */
+  def createScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+    new DeltaScanBuilder(spark, initialSnapshot, options)
+  }
 
   /**
    * Reports the partitioning scheme of this Delta table to Spark.

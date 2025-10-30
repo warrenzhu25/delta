@@ -93,8 +93,9 @@ trait DeltaPartitioningAwareScan extends Scan with SupportsReportPartitioning {
       // Report key-grouped partitioning to Spark
       // This tells Spark that data is already grouped by partition columns
       new KeyGroupedPartitioning(
-        toSparkTransforms(_groupingKeyType),
-        numPartitions = numFileGroups
+        toSparkTransforms(_groupingKeyType).asInstanceOf[Array[
+          org.apache.spark.sql.connector.expressions.Expression]],
+        numFileGroups
       )
     } else {
       // No partitioning information available
