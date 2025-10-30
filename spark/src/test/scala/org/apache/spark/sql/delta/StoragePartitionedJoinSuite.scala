@@ -38,9 +38,23 @@ class StoragePartitionedJoinSuite extends QueryTest
 
   override def beforeAll(): Unit = {
     super.beforeAll()
+    // Configure custom catalog for SPJ support
+    spark.conf.set(
+      "spark.sql.catalog.spark_catalog",
+      "org.apache.spark.sql.delta.catalog.DeltaCatalogWithSPJ"
+    )
     // Enable SPJ configurations
     spark.conf.set(DeltaSQLConf.PRESERVE_DATA_GROUPING.key, "true")
     spark.conf.set("spark.sql.sources.v2.bucketing.enabled", "true")
+  }
+
+  override def afterAll(): Unit = {
+    try {
+      // Reset catalog to default
+      spark.conf.unset("spark.sql.catalog.spark_catalog")
+    } finally {
+      super.afterAll()
+    }
   }
 
   test("storage-partitioned join eliminates shuffle for single partition column") {
