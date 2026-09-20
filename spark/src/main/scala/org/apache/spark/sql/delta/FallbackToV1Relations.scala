@@ -17,17 +17,25 @@
 package org.apache.spark.sql.delta
 
 import org.apache.spark.sql.delta.catalog.DeltaTableV2
+import org.apache.spark.sql.delta.sources.DeltaSQLConf
 
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 
 /**
- * Fall back to V1 nodes, since we don't have a V2 reader for Delta right now
+ * Fall back to V1 nodes unless DataSource V2 read is requested (e.g. for Storage-Partitioned Join).
  */
 object FallbackToV1DeltaRelation {
   def unapply(dsv2: DataSourceV2Relation): Option[LogicalRelation] = dsv2.table match {
     case d: DeltaTableV2 if dsv2.getTagValue(DeltaRelation.KEEP_AS_V2_RELATION_TAG).isEmpty =>
-      Some(DeltaRelation.fromV2Relation(d, dsv2, dsv2.options))
+      val spjEnabled = d.spark.sessionState.conf.getConf(
+        DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_ENABLED)
+      val isPartitioned = d.initialSnapshot.metadata.partitionColumns.nonEmpty
+      if (spjEnabled && isPartitioned) {
+        None
+      } else {
+        Some(DeltaRelation.fromV2Relation(d, dsv2, dsv2.options))
+      }
     case _ => None
   }
 }

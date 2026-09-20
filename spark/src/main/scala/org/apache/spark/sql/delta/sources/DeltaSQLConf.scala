@@ -262,6 +262,14 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       }
     )
 
+  val DELTA_STORAGE_PARTITIONED_JOIN_ENABLED =
+    buildConf("storagePartitionedJoin.enabled")
+      .doc("When true, Delta Lake enables DataSource V2 reads for partitioned tables to support " +
+        "Spark Storage-Partitioned Join (SPJ), eliminating join shuffle exchanges when join keys " +
+        "match table partition columns.")
+      .booleanConf
+      .createWithDefault(false)
+
   val DELTA_COMMIT_VALIDATION_ENABLED =
     buildConf("commitValidation.enabled")
       .internal()

@@ -42,11 +42,12 @@ import org.apache.spark.sql.catalyst.analysis.{ResolvedTable, UnresolvedTable}
 import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogTableType, CatalogUtils}
 import org.apache.spark.sql.catalyst.plans.logical.{AnalysisHelper, LogicalPlan, SubqueryAlias}
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
-import org.apache.spark.sql.connector.catalog.{SupportsWrite, Table, TableCapability, TableCatalog, V2TableWithV1Fallback}
+import org.apache.spark.sql.connector.catalog.{SupportsRead, SupportsWrite, Table, TableCapability, TableCatalog, V2TableWithV1Fallback}
 import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
 import org.apache.spark.sql.connector.catalog.TableCapability._
 import org.apache.spark.sql.connector.catalog.V1Table
 import org.apache.spark.sql.connector.expressions._
+import org.apache.spark.sql.connector.read.ScanBuilder
 import org.apache.spark.sql.connector.write.{LogicalWriteInfo, SupportsDynamicOverwrite, SupportsOverwrite, SupportsTruncate, V1Write, WriteBuilder}
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.datasources.LogicalRelation
@@ -69,6 +70,7 @@ class DeltaTableV2 private(
     val timeTravelOpt: Option[DeltaTimeTravelSpec],
     val options: Map[String, String])
   extends Table
+  with SupportsRead
   with SupportsWrite
   with V2TableWithV1Fallback
   with DeltaLogging
@@ -276,6 +278,15 @@ class DeltaTableV2 private(
 
   def tableExists: Boolean = deltaLog.tableExists
 
+
+  override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+    new org.apache.spark.sql.delta.v2.DeltaScanBuilder(
+      spark = spark,
+      deltaTable = this,
+      tableSchema = tableSchema,
+      options = options
+    )
+  }
 
   override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder = {
     new WriteIntoDeltaBuilder(
