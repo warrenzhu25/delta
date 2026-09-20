@@ -17,6 +17,8 @@
 package org.apache.spark.sql.delta
 
 import org.apache.spark.sql.delta.catalog.DeltaTableV2
+import org.apache.spark.sql.delta.commands.DeletionVectorUtils
+import org.apache.spark.sql.delta.commands.cdc.CDCReader
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 
 import org.apache.spark.sql.execution.datasources.LogicalRelation
@@ -30,8 +32,11 @@ object FallbackToV1DeltaRelation {
     case d: DeltaTableV2 if dsv2.getTagValue(DeltaRelation.KEEP_AS_V2_RELATION_TAG).isEmpty =>
       val spjEnabled = d.spark.sessionState.conf.getConf(
         DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_ENABLED)
-      val isPartitioned = d.initialSnapshot.metadata.partitionColumns.nonEmpty
-      if (spjEnabled && isPartitioned) {
+      val snapshot = d.initialSnapshot
+      val isPartitioned = snapshot.metadata.partitionColumns.nonEmpty
+      val isCDC = CDCReader.isCDCRead(dsv2.options)
+      val hasDeletionVectors = DeletionVectorUtils.deletionVectorsReadable(snapshot)
+      if (spjEnabled && isPartitioned && !isCDC && !hasDeletionVectors) {
         None
       } else {
         Some(DeltaRelation.fromV2Relation(d, dsv2, dsv2.options))

@@ -16,23 +16,28 @@
 
 package org.apache.spark.sql.delta.v2
 
+import java.net.URI
+import java.util.Locale
+
+import org.apache.hadoop.fs.Path
+
 import org.apache.spark.paths.SparkPath
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Cast, GenericInternalRow, Literal}
-import org.apache.spark.sql.connector.expressions.{Expression => V2Expression, Expressions, Transform}
+import org.apache.spark.sql.connector.expressions.{Expression => V2Expression, Expressions}
 import org.apache.spark.sql.connector.read._
 import org.apache.spark.sql.connector.read.partitioning.{KeyGroupedPartitioning, Partitioning, UnknownPartitioning}
 import org.apache.spark.sql.delta._
 import org.apache.spark.sql.delta.actions.{AddFile, Metadata, Protocol}
 import org.apache.spark.sql.delta.catalog.DeltaTableV2
-import org.apache.spark.sql.delta.files.TahoeFileIndex
 import org.apache.spark.sql.delta.metering.DeltaLogging
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.execution.datasources.{FileFormat, PartitionedFile}
 import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.util.SerializableConfiguration
 
 /**
  * ScanBuilder for Delta DataSource V2 reader with Storage-Partitioned Join (SPJ) support.
@@ -52,7 +57,7 @@ class DeltaScanBuilder(
 
   override def pushFilters(filters: Array[Filter]): Array[Filter] = {
     // Keep all filters as residuals so Spark applies them locally, while also
-    // pushing them down to prune files in DeltaLog where possible.
+    // translating them into Catalyst predicates to prune files/partitions in DeltaLog.
     _pushedFilters = filters
     filters
   }
@@ -82,7 +87,7 @@ class DeltaScanBuilder(
  * For partitioned Delta tables where all partition columns are preserved in the readSchema
  * and SPJ is enabled via `spark.sql.sources.v2.bucketing.enabled = true` and
  * `spark.databricks.delta.storagePartitionedJoin.enabled = true`, this scan groups AddFiles
- * by their physical partition values into [[DeltaInputPartition]]s that implement
+ * by their physical partition values into [[DeltaKeyGroupedInputPartition]]s that implement
  * [[HasPartitionKey]].
  */
 class DeltaBatchScan(
@@ -122,32 +127,46 @@ class DeltaBatchScan(
   /**
    * Whether SPJ grouping can be active for this scan:
    * 1. The table must have partition columns.
-   * 2. All partition columns must be present in the readSchema.
+   * 2. All partition columns must be present in the readSchema (case-insensitive).
    * 3. Delta SPJ configuration must be enabled.
    */
   private def isSPJEligible: Boolean = {
+    // scalastyle:off caselocale
+    val readFieldNamesLower = readSchema.fieldNames.map(_.toLowerCase(Locale.ROOT)).toSet
+    val allPartitionColsPresent = partitionColumns.forall { col =>
+      readFieldNamesLower.contains(col.toLowerCase(Locale.ROOT))
+    }
+    // scalastyle:on caselocale
     partitionColumns.nonEmpty &&
-      partitionColumns.forall(c => readSchema.fieldNames.contains(c)) &&
+      allPartitionColsPresent &&
       spark.sessionState.conf.getConf(DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_ENABLED)
   }
 
   /**
-   * Lazily planned input partitions grouped by partition key when SPJ is eligible.
+   * Lazily planned input partitions:
+   * - Prunes files in the Delta Snapshot using pushed filters (partition pruning & data skipping).
+   * - Groups matching AddFiles by partition key when SPJ is eligible.
    */
   private lazy val plannedPartitions: Array[InputPartition] = {
-    val fileIndex = deltaTable.deltaLog.createRelation(
-      snapshotToUseOpt = Some(snapshot),
-      catalogTableOpt = deltaTable.catalogTable,
-      isTimeTravelQuery = deltaTable.timeTravelOpt.isDefined
-    ).asInstanceOf[org.apache.spark.sql.execution.datasources.HadoopFsRelation].location
-      .asInstanceOf[TahoeFileIndex]
+    val attrMap = org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes(tableSchema)
+      .map(a => a.name -> a).toMap
+    val catalystFilters = pushedFilters.flatMap { f =>
+      scala.util.Try(
+        org.apache.spark.sql.delta.sources.DeltaSourceUtils.translateFilters(Array(f))
+      ).toOption
+    }.map { expr =>
+      expr.transform {
+        case u: org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute =>
+          attrMap.getOrElse(u.name, u)
+      }
+    }.filter(_.resolved)
 
-    val addFiles: Seq[AddFile] = fileIndex.matchingFiles(Seq.empty, Seq.empty)
+    val addFiles: Seq[AddFile] = snapshot.filesForScan(catalystFilters).files
 
     if (isSPJEligible) {
-      planKeyGroupedPartitions(addFiles)
+      planPartitions(addFiles.groupBy(_.partitionValues).toSeq)
     } else {
-      planStandardPartitions(addFiles)
+      planPartitions(addFiles.map(f => (f.partitionValues, Seq(f))))
     }
   }
 
@@ -163,16 +182,13 @@ class DeltaBatchScan(
     new GenericInternalRow(partitionRowValues)
   }
 
-  private def planKeyGroupedPartitions(addFiles: Seq[AddFile]): Array[InputPartition] = {
-    // Group files by their partition values map
-    val grouped = addFiles.groupBy(_.partitionValues)
-
-    grouped.zipWithIndex.map { case ((partValuesMap, files), idx) =>
+  private def planPartitions(
+      groups: Seq[(Map[String, String], Seq[AddFile])]): Array[InputPartition] = {
+    groups.zipWithIndex.map { case ((partValuesMap, files), idx) =>
       val partitionKeyRow = extractPartitionRow(partValuesMap)
-
       val fileInfos = files.map { f =>
         DeltaScanFileInfo(
-          path = fileIndex_absolutePath(f.path),
+          path = resolveFilePath(f.path),
           size = f.size,
           modificationTime = f.modificationTime,
           partitionValues = partitionKeyRow
@@ -187,29 +203,14 @@ class DeltaBatchScan(
     }.toArray
   }
 
-  private def planStandardPartitions(addFiles: Seq[AddFile]): Array[InputPartition] = {
-    addFiles.zipWithIndex.map { case (f, idx) =>
-      val partitionKeyRow = extractPartitionRow(f.partitionValues)
-      val fileInfo = DeltaScanFileInfo(
-        path = fileIndex_absolutePath(f.path),
-        size = f.size,
-        modificationTime = f.modificationTime,
-        partitionValues = partitionKeyRow
-      )
-      DeltaKeyGroupedInputPartition(
-        partitionId = idx,
-        files = Array(fileInfo),
-        partitionKeyInternalRow = partitionKeyRow
-      ): InputPartition
-    }.toArray
-  }
-
-  private def fileIndex_absolutePath(child: String): String = {
-    val p = new org.apache.hadoop.fs.Path(new java.net.URI(child))
+  private def resolveFilePath(child: String): String = {
+    // scalastyle:off pathfromuri
+    val p = new Path(new URI(child))
+    // scalastyle:on pathfromuri
     if (p.isAbsolute) {
       p.toString
     } else {
-      new org.apache.hadoop.fs.Path(deltaTable.deltaLog.dataPath, p).toString
+      new Path(deltaTable.deltaLog.dataPath, p).toString
     }
   }
 
@@ -226,6 +227,7 @@ class DeltaBatchScan(
   }
 
   override def createReaderFactory(): PartitionReaderFactory = {
+    val hadoopConf = new SerializableConfiguration(deltaTable.deltaLog.newDeltaHadoopConf())
     new DeltaPartitionReaderFactory(
       spark = spark,
       dataSchema = tableSchema,
@@ -233,7 +235,8 @@ class DeltaBatchScan(
       readSchema = readSchema,
       protocol = protocol,
       metadata = metadata,
-      options = options
+      pushedFilters = pushedFilters,
+      serializableHadoopConf = hadoopConf
     )
   }
 }
@@ -265,8 +268,7 @@ case class DeltaKeyGroupedInputPartition(
 
 /**
  * Factory for creating PartitionReaders for Delta tables in DSv2.
- * Serializes Hadoop Configuration to executors and uses [[DeltaParquetFileFormat]]
- * to build Parquet file readers.
+ * Uses [[DeltaParquetFileFormat]] to build Parquet file readers on the driver.
  */
 class DeltaPartitionReaderFactory(
     spark: SparkSession,
@@ -275,19 +277,10 @@ class DeltaPartitionReaderFactory(
     readSchema: StructType,
     protocol: Protocol,
     metadata: Metadata,
-    options: CaseInsensitiveStringMap)
+    pushedFilters: Array[Filter],
+    serializableHadoopConf: SerializableConfiguration)
   extends PartitionReaderFactory {
 
-  import org.apache.spark.util.SerializableConfiguration
-
-  private val serializableHadoopConf = {
-    // scalastyle:off deltahadoopconfiguration
-    val conf = spark.sessionState.newHadoopConf()
-    // scalastyle:on deltahadoopconfiguration
-    new SerializableConfiguration(conf)
-  }
-
-  // Pre-build the Parquet reader function on the driver
   private val parquetFormat = new DeltaParquetFileFormat(protocol, metadata)
 
   private val readerBuilder = parquetFormat.buildReaderWithPartitionValues(
@@ -295,7 +288,7 @@ class DeltaPartitionReaderFactory(
     dataSchema = dataSchema,
     partitionSchema = partitionSchema,
     requiredSchema = readSchema,
-    filters = Seq.empty,
+    filters = pushedFilters.toSeq,
     options = Map(FileFormat.OPTION_RETURNING_BATCH -> "false"),
     hadoopConf = serializableHadoopConf.value
   )
@@ -307,7 +300,8 @@ class DeltaPartitionReaderFactory(
 }
 
 /**
- * PartitionReader that iterates through all files assigned to an InputPartition.
+ * PartitionReader that iterates through all files assigned to an InputPartition
+ * and ensures underlying Parquet iterators are properly closed.
  */
 class DeltaBatchPartitionReader(
     partition: DeltaKeyGroupedInputPartition,
@@ -317,8 +311,17 @@ class DeltaBatchPartitionReader(
   private val fileIterator: Iterator[DeltaScanFileInfo] = partition.files.iterator
   private var currentFileReader: Option[Iterator[InternalRow]] = None
 
+  private def closeCurrentFileReader(): Unit = {
+    currentFileReader.foreach {
+      case closeable: AutoCloseable => closeable.close()
+      case _ =>
+    }
+    currentFileReader = None
+  }
+
   private def advanceToNextFile(): Boolean = {
     while (currentFileReader.forall(!_.hasNext) && fileIterator.hasNext) {
+      closeCurrentFileReader()
       val fileInfo = fileIterator.next()
       val partitionedFile = PartitionedFile(
         partitionValues = fileInfo.partitionValues,
@@ -344,6 +347,6 @@ class DeltaBatchPartitionReader(
   }
 
   override def close(): Unit = {
-    // Current reader will be GC'd; no-op
+    closeCurrentFileReader()
   }
 }
