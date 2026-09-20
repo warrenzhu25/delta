@@ -114,38 +114,48 @@ class DeltaBatchScan(
   private val metadata: Metadata = snapshot.metadata
   private val partitionColumns: Seq[String] = metadata.partitionColumns
 
+  // scalastyle:off caselocale
+  private lazy val readFieldNamesLower: Set[String] =
+    readSchema.fieldNames.map(_.toLowerCase(Locale.ROOT)).toSet
+
+  /**
+   * Partition columns that are present in the projected `readSchema`.
+   * Following Apache Iceberg (`Partitioning.groupingKeyType`), only partition columns
+   * preserved in the query projection are included in the grouping key. This enables SPJ
+   * even when the query only projects and joins on a subset of the table's partition columns.
+   */
+  private lazy val projectedPartitionFields = metadata.partitionSchema.filter { f =>
+    readFieldNamesLower.contains(f.name.toLowerCase(Locale.ROOT))
+  }
+  // scalastyle:on caselocale
+
+  private lazy val projectedPartitionColumns: Seq[String] =
+    projectedPartitionFields.map(_.name)
+
   /**
    * The grouping key transforms reported to Spark for SPJ.
-   * Only identity partitioning is reported.
+   * Only identity partitioning on projected partition columns is reported.
    */
   private lazy val groupingKeyTransforms: Array[V2Expression] = {
-    partitionColumns.map { col =>
+    projectedPartitionColumns.map { col =>
       Expressions.identity(col): V2Expression
     }.toArray
   }
 
   /**
    * Whether SPJ grouping can be active for this scan:
-   * 1. The table must have partition columns.
-   * 2. All partition columns must be present in the readSchema (case-insensitive).
-   * 3. Delta SPJ configuration must be enabled.
+   * 1. At least one partition column is present in the projected readSchema.
+   * 2. Delta SPJ configuration is enabled.
    */
   private def isSPJEligible: Boolean = {
-    // scalastyle:off caselocale
-    val readFieldNamesLower = readSchema.fieldNames.map(_.toLowerCase(Locale.ROOT)).toSet
-    val allPartitionColsPresent = partitionColumns.forall { col =>
-      readFieldNamesLower.contains(col.toLowerCase(Locale.ROOT))
-    }
-    // scalastyle:on caselocale
-    partitionColumns.nonEmpty &&
-      allPartitionColsPresent &&
+    projectedPartitionColumns.nonEmpty &&
       spark.sessionState.conf.getConf(DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_ENABLED)
   }
 
   /**
    * Lazily planned input partitions:
    * - Prunes files in the Delta Snapshot using pushed filters (partition pruning & data skipping).
-   * - Groups matching AddFiles by partition key when SPJ is eligible.
+   * - Groups matching AddFiles by projected partition key when SPJ is eligible.
    */
   private lazy val plannedPartitions: Array[InputPartition] = {
     val attrMap = org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes(tableSchema)
@@ -164,16 +174,21 @@ class DeltaBatchScan(
     val addFiles: Seq[AddFile] = snapshot.filesForScan(catalystFilters).files
 
     if (isSPJEligible) {
-      planPartitions(addFiles.groupBy(_.partitionValues).toSeq)
+      val projectedPhysicalCols = projectedPartitionFields.map(DeltaColumnMapping.getPhysicalName)
+      val grouped = addFiles.groupBy { f =>
+        projectedPhysicalCols.map(col => col -> f.partitionValues.getOrElse(col, null)).toMap
+      }.toSeq
+      planPartitions(grouped)
     } else {
       planPartitions(addFiles.map(f => (f.partitionValues, Seq(f))))
     }
   }
 
-  private def extractPartitionRow(partValuesMap: Map[String, String]): GenericInternalRow = {
-    val partitionSchema = metadata.partitionSchema
+  private def extractPartitionRow(
+      partValuesMap: Map[String, String],
+      schemaFields: Seq[org.apache.spark.sql.types.StructField]): GenericInternalRow = {
     val timeZone = spark.sessionState.conf.sessionLocalTimeZone
-    val partitionRowValues = partitionSchema.map { p =>
+    val partitionRowValues = schemaFields.map { p =>
       val colPhysicalName = DeltaColumnMapping.getPhysicalName(p)
       val partValueStr = partValuesMap.get(colPhysicalName).orNull
       val literalVal = Literal(partValueStr)
@@ -184,21 +199,22 @@ class DeltaBatchScan(
 
   private def planPartitions(
       groups: Seq[(Map[String, String], Seq[AddFile])]): Array[InputPartition] = {
-    groups.zipWithIndex.map { case ((partValuesMap, files), idx) =>
-      val partitionKeyRow = extractPartitionRow(partValuesMap)
+    groups.zipWithIndex.map { case (_, files) -> idx =>
+      val groupingKeyRow = extractPartitionRow(files.head.partitionValues, projectedPartitionFields)
       val fileInfos = files.map { f =>
+        val fullFilePartitionRow = extractPartitionRow(f.partitionValues, metadata.partitionSchema)
         DeltaScanFileInfo(
           path = resolveFilePath(f.path),
           size = f.size,
           modificationTime = f.modificationTime,
-          partitionValues = partitionKeyRow
+          partitionValues = fullFilePartitionRow
         )
       }.toArray
 
       DeltaKeyGroupedInputPartition(
         partitionId = idx,
         files = fileInfos,
-        partitionKeyInternalRow = partitionKeyRow
+        partitionKeyInternalRow = groupingKeyRow
       ): InputPartition
     }.toArray
   }

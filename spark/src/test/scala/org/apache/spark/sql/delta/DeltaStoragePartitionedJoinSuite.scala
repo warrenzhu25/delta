@@ -373,4 +373,135 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
       }
     }
   }
+
+  test("E2E SPJ: Left, Right, and Full Outer Joins without shuffle exchanges") {
+    withTable("t_outer1", "t_outer2") {
+      val df1 = Seq((1, "a", "p1"), (2, "b", "p2")).toDF("id", "val1", "part")
+      val df2 = Seq((20, "y", "p2"), (30, "z", "p3")).toDF("id", "val2", "part")
+
+      df1.write.format("delta").partitionBy("part").saveAsTable("t_outer1")
+      df2.write.format("delta").partitionBy("part").saveAsTable("t_outer2")
+
+      withSPJConf(enabled = true) {
+        // Left Outer Join
+        val leftQ = spark.sql(
+          "SELECT t1.id, t2.id, t1.part FROM t_outer1 t1 LEFT OUTER JOIN t_outer2 t2 ON t1.part = t2.part")
+        checkAnswer(leftQ, Seq((Some(1), None, "p1"), (Some(2), Some(20), "p2")).toDF("id1", "id2", "part"))
+        assertSPJPlan(leftQ, expectSPJ = true)
+
+        // Right Outer Join
+        val rightQ = spark.sql(
+          "SELECT t1.id, t2.id, t2.part FROM t_outer1 t1 RIGHT OUTER JOIN t_outer2 t2 ON t1.part = t2.part")
+        checkAnswer(rightQ, Seq((Some(2), Some(20), "p2"), (None, Some(30), "p3")).toDF("id1", "id2", "part"))
+        assertSPJPlan(rightQ, expectSPJ = true)
+
+        // Full Outer Join
+        val fullQ = spark.sql(
+          "SELECT t1.id, t2.id, COALESCE(t1.part, t2.part) FROM t_outer1 t1 FULL OUTER JOIN t_outer2 t2 ON t1.part = t2.part")
+        checkAnswer(fullQ, Seq((Some(1), None, "p1"), (Some(2), Some(20), "p2"), (None, Some(30), "p3")).toDF("id1", "id2", "part"))
+        assertSPJPlan(fullQ, expectSPJ = true)
+      }
+    }
+  }
+
+  test("E2E SPJ: Join keys subset of partition keys (allowJoinKeysSubsetOfPartitionKeys)") {
+    withTable("t_sub1", "t_sub2") {
+      val df1 = Seq((1, "us", "ca"), (2, "us", "ny"), (3, "eu", "de")).toDF("id", "region", "state")
+      val df2 = Seq((10, "us", "tx"), (20, "eu", "fr")).toDF("id", "region", "state")
+
+      df1.write.format("delta").partitionBy("region", "state").saveAsTable("t_sub1")
+      df2.write.format("delta").partitionBy("region", "state").saveAsTable("t_sub2")
+
+      withSPJConf(enabled = true) {
+        withSQLConf(
+          SQLConf.V2_BUCKETING_ALLOW_JOIN_KEYS_SUBSET_OF_PARTITION_KEYS.key -> "true"
+        ) {
+          // Join only on `region` (subset of `(region, state)`)
+          val query = spark.sql(
+            "SELECT t1.id, t2.id, t1.region FROM t_sub1 t1 JOIN t_sub2 t2 ON t1.region = t2.region")
+          checkAnswer(
+            query,
+            Seq((1, 10, "us"), (2, 10, "us"), (3, 20, "eu")).toDF("id1", "id2", "region")
+          )
+          assertSPJPlan(query, expectSPJ = true)
+        }
+      }
+    }
+  }
+
+  test("SPJ with WHERE partition filter pushdown prunes non-matching partitions") {
+    withTable("t_prune1", "t_prune2") {
+      val df1 = Seq((1, "p1"), (2, "p2"), (3, "p3")).toDF("id", "part")
+      val df2 = Seq((10, "p1"), (20, "p2"), (30, "p3")).toDF("id", "part")
+
+      df1.write.format("delta").partitionBy("part").saveAsTable("t_prune1")
+      df2.write.format("delta").partitionBy("part").saveAsTable("t_prune2")
+
+      withSPJConf(enabled = true) {
+        val query = spark.sql(
+          "SELECT t1.id, t2.id, t1.part FROM t_prune1 t1 JOIN t_prune2 t2 ON t1.part = t2.part WHERE t1.part = 'p2'")
+        checkAnswer(query, Seq((2, 20, "p2")).toDF("id1", "id2", "part"))
+        assertSPJPlan(query, expectSPJ = true)
+
+        val scans = query.queryExecution.executedPlan.collect { case b: BatchScanExec => b }
+        // Verify partition pruning reduced planned partitions to 1 on each side
+        assert(scans.forall(_.scan.asInstanceOf[DeltaBatchScan].planInputPartitions().length == 1),
+          "Partition filter pushdown should prune scan to 1 partition")
+      }
+    }
+  }
+
+  test("Deletion Vector enabled table safely falls back to V1 and filters deleted rows") {
+    withTable("t_dv1", "t_dv2") {
+      sql("CREATE TABLE t_dv1 (id INT, part STRING) USING delta PARTITIONED BY (part) " +
+        "TBLPROPERTIES ('delta.enableDeletionVectors' = 'true')")
+      sql("CREATE TABLE t_dv2 (id INT, part STRING) USING delta PARTITIONED BY (part)")
+
+      sql("INSERT INTO t_dv1 VALUES (1, 'p1'), (2, 'p1'), (3, 'p2')")
+      sql("INSERT INTO t_dv2 VALUES (10, 'p1'), (30, 'p2')")
+      // Delete one row from p1 to generate a Deletion Vector
+      sql("DELETE FROM t_dv1 WHERE id = 2")
+
+      withSPJConf(enabled = true) {
+        val query = spark.sql("SELECT t1.id, t2.id, t1.part FROM t_dv1 t1 JOIN t_dv2 t2 ON t1.part = t2.part")
+        // Verify deleted row id = 2 is NOT returned
+        checkAnswer(query, Seq((1, 10, "p1"), (3, 30, "p2")).toDF("id1", "id2", "part"))
+      }
+    }
+  }
+
+  test("SPJ with Delta Column Mapping (name mode)") {
+    withTable("t_cm1", "t_cm2") {
+      sql("CREATE TABLE t_cm1 (id INT, part STRING) USING delta PARTITIONED BY (part) " +
+        "TBLPROPERTIES ('delta.columnMapping.mode' = 'name')")
+      sql("CREATE TABLE t_cm2 (id INT, part STRING) USING delta PARTITIONED BY (part) " +
+        "TBLPROPERTIES ('delta.columnMapping.mode' = 'name')")
+
+      sql("INSERT INTO t_cm1 VALUES (1, 'p1'), (2, 'p2')")
+      sql("INSERT INTO t_cm2 VALUES (10, 'p1'), (20, 'p2')")
+
+      withSPJConf(enabled = true) {
+        val query = spark.sql("SELECT t1.id, t2.id, t1.part FROM t_cm1 t1 JOIN t_cm2 t2 ON t1.part = t2.part")
+        checkAnswer(query, Seq((1, 10, "p1"), (2, 20, "p2")).toDF("id1", "id2", "part"))
+        assertSPJPlan(query, expectSPJ = true)
+      }
+    }
+  }
+
+  test("SPJ with tables containing NULL partition values") {
+    withTable("t_null1", "t_null2") {
+      val df1 = Seq((1, Some("p1")), (2, None)).toDF("id", "part")
+      val df2 = Seq((10, Some("p1")), (20, None)).toDF("id", "part")
+
+      df1.write.format("delta").partitionBy("part").saveAsTable("t_null1")
+      df2.write.format("delta").partitionBy("part").saveAsTable("t_null2")
+
+      withSPJConf(enabled = true) {
+        // Equality join on tables that contain NULL partition values should still eliminate shuffle
+        val query = spark.sql("SELECT t1.id, t2.id, t1.part FROM t_null1 t1 JOIN t_null2 t2 ON t1.part = t2.part")
+        checkAnswer(query, Seq((1, 10, "p1")).toDF("id1", "id2", "part"))
+        assertSPJPlan(query, expectSPJ = true)
+      }
+    }
+  }
 }
