@@ -22,7 +22,9 @@ import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
 import org.apache.spark.sql.delta.v2.DeltaBatchScan
 
-import org.apache.spark.sql.{DataFrame, QueryTest}
+import org.apache.spark.sql.{DataFrame, QueryTest, Row}
+import org.apache.spark.sql.catalyst.plans.physical.RangePartitioning
+import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
 import org.apache.spark.sql.internal.SQLConf
@@ -49,22 +51,25 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
     )(f)
   }
 
+  private def batchScans(plan: SparkPlan): Seq[BatchScanExec] =
+    plan.collect { case b: BatchScanExec => b }
+
+  /** Shuffles introduced for joins/aggregations, i.e. excluding range shuffles for ORDER BY. */
+  private def joinShuffles(plan: SparkPlan): Seq[ShuffleExchangeExec] = plan.collect {
+    case s: ShuffleExchangeExec if !s.outputPartitioning.isInstanceOf[RangePartitioning] => s
+  }
+
   private def assertSPJPlan(query: DataFrame, expectSPJ: Boolean): Unit = {
     val executedPlan = query.queryExecution.executedPlan
-    val joinShuffles = executedPlan.collect {
-      case s: ShuffleExchangeExec if !s.outputPartitioning.isInstanceOf[org.apache.spark.sql.catalyst.plans.physical.RangePartitioning] => s
-    }
-    val scans = executedPlan.collect { case b: BatchScanExec => b }
-
+    val shuffles = joinShuffles(executedPlan)
     if (expectSPJ) {
+      val scans = batchScans(executedPlan)
       assert(scans.nonEmpty, "Expected BatchScanExec when SPJ is enabled")
       assert(scans.forall(_.scan.isInstanceOf[DeltaBatchScan]),
         "All scans should be DeltaBatchScan instances")
-      assert(joinShuffles.isEmpty,
-        s"Expected 0 join shuffle exchanges with SPJ, but found: $joinShuffles")
+      assert(shuffles.isEmpty, s"Expected 0 join shuffle exchanges with SPJ, but found: $shuffles")
     } else {
-      assert(joinShuffles.nonEmpty,
-        "Expected join shuffle exchanges when SPJ is not applicable")
+      assert(shuffles.nonEmpty, "Expected join shuffle exchanges when SPJ is not applicable")
     }
   }
 
@@ -139,7 +144,8 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
 
       withSPJConf(enabled = true) {
         val query = spark.sql(
-          "SELECT t1.id, t2.id, t1.part FROM t_sparse1 t1 INNER JOIN t_sparse2 t2 ON t1.part = t2.part")
+          "SELECT t1.id, t2.id, t1.part FROM t_sparse1 t1 " +
+            "INNER JOIN t_sparse2 t2 ON t1.part = t2.part")
 
         checkAnswer(query, Seq((2, 2, "p2")).toDF("id1", "id2", "part"))
         assertSPJPlan(query, expectSPJ = true)
@@ -193,8 +199,75 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
             |ON t1.date_col = t2.date_col AND t1.category = t2.category
             |""".stripMargin)
 
-        checkAnswer(query, Seq((1, 10, 100, d1), (2, 20, 200, d2)).toDF("id", "other_id", "category", "date_col"))
+        checkAnswer(
+          query,
+          Seq((1, 10, 100, d1), (2, 20, 200, d2)).toDF("id", "other_id", "category", "date_col"))
         assertSPJPlan(query, expectSPJ = true)
+      }
+    }
+  }
+
+  test("SPJ with Timestamp partition column returns the same values as V1") {
+    withTable("t_ts") {
+      sql("CREATE TABLE t_ts (id INT, ts TIMESTAMP) USING delta PARTITIONED BY (ts)")
+      sql("INSERT INTO t_ts VALUES (1, TIMESTAMP'2026-01-01 10:00:00'), " +
+        "(2, TIMESTAMP'2026-06-01 23:59:59')")
+      val expected = sql("SELECT * FROM t_ts").collect().toSeq
+
+      withSPJConf(enabled = true) {
+        val query = sql("SELECT * FROM t_ts")
+        checkAnswer(query, expected)
+        assert(batchScans(query.queryExecution.executedPlan).nonEmpty)
+      }
+    }
+  }
+
+  test("Partition column that is not the last column in the schema") {
+    withTable("t_order") {
+      sql("CREATE TABLE t_order (part STRING, id INT, v STRING) USING delta PARTITIONED BY (part)")
+      sql("INSERT INTO t_order VALUES ('a', 1, 'x'), ('b', 2, 'y')")
+
+      withSPJConf(enabled = true) {
+        val query = sql("SELECT * FROM t_order")
+        checkAnswer(query, Seq(Row("a", 1, "x"), Row("b", 2, "y")))
+        assert(batchScans(query.queryExecution.executedPlan).nonEmpty)
+        checkAnswer(sql("SELECT id, part FROM t_order"), Seq(Row(1, "a"), Row(2, "b")))
+        checkAnswer(sql("SELECT v FROM t_order WHERE id = 2"), Seq(Row("y")))
+        checkAnswer(sql("SELECT part FROM t_order"), Seq(Row("a"), Row("b")))
+        checkAnswer(sql("SELECT count(*) FROM t_order"), Row(2L))
+      }
+    }
+  }
+
+  test("Time travel reads the requested version") {
+    withTable("t_tt") {
+      sql("CREATE TABLE t_tt (id INT, part STRING) USING delta PARTITIONED BY (part)")
+      sql("INSERT INTO t_tt VALUES (1, 'a')")
+      sql("INSERT INTO t_tt VALUES (2, 'b')")
+
+      withSPJConf(enabled = true) {
+        checkAnswer(sql("SELECT * FROM t_tt VERSION AS OF 1"), Seq(Row(1, "a")))
+        checkAnswer(spark.read.option("versionAsOf", "1").table("t_tt"), Seq(Row(1, "a")))
+        checkAnswer(sql("SELECT * FROM t_tt"), Seq(Row(1, "a"), Row(2, "b")))
+      }
+    }
+  }
+
+  test("DML on partitioned tables works with SPJ enabled") {
+    withTable("t_dml", "t_src") {
+      sql("CREATE TABLE t_dml (id INT, part STRING) USING delta PARTITIONED BY (part)")
+      sql("CREATE TABLE t_src (id INT, part STRING) USING delta PARTITIONED BY (part)")
+      sql("INSERT INTO t_dml VALUES (1, 'a'), (2, 'b')")
+      sql("INSERT INTO t_src VALUES (2, 'b'), (3, 'c')")
+
+      withSPJConf(enabled = true) {
+        sql("UPDATE t_dml SET id = 10 WHERE part = 'a'")
+        sql("DELETE FROM t_dml WHERE id = 2")
+        sql("MERGE INTO t_dml t USING t_src s ON t.part = s.part " +
+          "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
+        sql("INSERT INTO t_dml SELECT * FROM t_src WHERE part = 'c'")
+        checkAnswer(sql("SELECT * FROM t_dml"),
+          Seq(Row(10, "a"), Row(2, "b"), Row(3, "c"), Row(3, "c")))
       }
     }
   }
@@ -209,7 +282,7 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
       df2.write.format("delta").partitionBy("part2").saveAsTable("t_incompat2")
 
       withSPJConf(enabled = true) {
-        // Join on t1.part1 = t2.part1: t2 is NOT partitioned by part1, so SPJ cannot eliminate shuffles
+        // t2 is NOT partitioned by part1, so SPJ cannot eliminate shuffles
         val query = spark.sql(
           "SELECT t1.id, t2.id FROM t_incompat1 t1 JOIN t_incompat2 t2 ON t1.part1 = t2.part1")
 
@@ -243,10 +316,8 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
       df1.write.format("delta").partitionBy("part").saveAsTable("t_empty1")
 
       // Empty table with same partition schema
-      spark.createDataFrame(
-        sparkContext.emptyRDD[org.apache.spark.sql.Row],
-        df1.schema
-      ).write.format("delta").partitionBy("part").saveAsTable("t_empty2")
+      spark.createDataFrame(sparkContext.emptyRDD[Row], df1.schema)
+        .write.format("delta").partitionBy("part").saveAsTable("t_empty2")
 
       withSPJConf(enabled = true) {
         val query = spark.sql(
@@ -266,14 +337,30 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
       df.write.format("delta").partitionBy("part").saveAsTable("t_v1")
 
       withSQLConf(
+        SQLConf.V2_BUCKETING_ENABLED.key -> "true",
         DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_ENABLED.key -> "false"
       ) {
         val query = spark.sql("SELECT * FROM t_v1")
         checkAnswer(query, Seq((1, "p1"), (2, "p2")).toDF("id", "part"))
+        assert(batchScans(query.queryExecution.executedPlan).isEmpty,
+          "Should not use BatchScanExec when SPJ is disabled")
+      }
+    }
+  }
 
-        val executedPlan = query.queryExecution.executedPlan
-        val batchScans = executedPlan.collect { case b: BatchScanExec => b }
-        assert(batchScans.isEmpty, "Should not use BatchScanExec when SPJ is disabled")
+  test("Fallback to V1 reader when Spark V2 bucketing is disabled") {
+    withTable("t_v1_bucketing") {
+      val df = Seq((1, "p1"), (2, "p2")).toDF("id", "part")
+      df.write.format("delta").partitionBy("part").saveAsTable("t_v1_bucketing")
+
+      withSQLConf(
+        SQLConf.V2_BUCKETING_ENABLED.key -> "false",
+        DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_ENABLED.key -> "true"
+      ) {
+        val query = spark.sql("SELECT * FROM t_v1_bucketing")
+        checkAnswer(query, Seq((1, "p1"), (2, "p2")).toDF("id", "part"))
+        assert(batchScans(query.queryExecution.executedPlan).isEmpty,
+          "Should not use BatchScanExec when spark.sql.sources.v2.bucketing.enabled is false")
       }
     }
   }
@@ -283,9 +370,12 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
 
   test("E2E SPJ: Three-way partitioned join without shuffle exchanges") {
     withTable("t_three1", "t_three2", "t_three3") {
-      val d1 = Seq((1, "Alice", "hr"), (2, "Bob", "eng"), (3, "Carol", "sales")).toDF("id", "name", "dept")
-      val d2 = Seq((1, 1000, "hr"), (2, 2000, "eng"), (3, 3000, "sales")).toDF("id", "salary", "dept")
-      val d3 = Seq((1, "NYC", "hr"), (2, "SF", "eng"), (3, "CHI", "sales")).toDF("id", "location", "dept")
+      val d1 = Seq((1, "Alice", "hr"), (2, "Bob", "eng"), (3, "Carol", "sales"))
+        .toDF("id", "name", "dept")
+      val d2 = Seq((1, 1000, "hr"), (2, 2000, "eng"), (3, 3000, "sales"))
+        .toDF("id", "salary", "dept")
+      val d3 = Seq((1, "NYC", "hr"), (2, "SF", "eng"), (3, "CHI", "sales"))
+        .toDF("id", "location", "dept")
 
       d1.write.format("delta").partitionBy("dept").saveAsTable("t_three1")
       d2.write.format("delta").partitionBy("dept").saveAsTable("t_three2")
@@ -309,12 +399,10 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
         )
 
         val executedPlan = query.queryExecution.executedPlan
-        val scans = executedPlan.collect { case b: BatchScanExec => b }
+        val scans = batchScans(executedPlan)
         assert(scans.size == 3, s"Expected 3 BatchScanExecs, got ${scans.size}")
-        val joinShuffles = executedPlan.collect {
-          case s: ShuffleExchangeExec if !s.outputPartitioning.isInstanceOf[org.apache.spark.sql.catalyst.plans.physical.RangePartitioning] => s
-        }
-        assert(joinShuffles.isEmpty, s"Expected 0 join shuffles for 3-way SPJ, but found: $joinShuffles")
+        val shuffles = joinShuffles(executedPlan)
+        assert(shuffles.isEmpty, s"Expected 0 join shuffles for 3-way SPJ, but found: $shuffles")
       }
     }
   }
@@ -339,10 +427,10 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
         )
 
         val executedPlan = query.queryExecution.executedPlan
-        val scans = executedPlan.collect { case b: BatchScanExec => b }
-        assert(scans.nonEmpty, "Should use DeltaBatchScan")
+        assert(batchScans(executedPlan).nonEmpty, "Should use DeltaBatchScan")
         val shuffles = executedPlan.collect { case s: ShuffleExchangeExec => s }
-        assert(shuffles.isEmpty, s"Expected 0 shuffle exchanges for partition-keyed aggregation, but found: $shuffles")
+        assert(shuffles.isEmpty,
+          s"Expected 0 shuffle exchanges for partition-keyed aggregation, but found: $shuffles")
       }
     }
   }
@@ -364,12 +452,11 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
         checkAnswer(query, Seq((1, "hr"), (2, "eng")).toDF("id", "dept"))
 
         val executedPlan = query.queryExecution.executedPlan
-        val scans = executedPlan.collect { case b: BatchScanExec => b }
+        val scans = batchScans(executedPlan)
         assert(scans.size == 2, s"Expected 2 BatchScanExecs for semi-join, got ${scans.size}")
-        val joinShuffles = executedPlan.collect {
-          case s: ShuffleExchangeExec if !s.outputPartitioning.isInstanceOf[org.apache.spark.sql.catalyst.plans.physical.RangePartitioning] => s
-        }
-        assert(joinShuffles.isEmpty, s"Expected 0 join shuffles for semi-join with SPJ, but found: $joinShuffles")
+        val shuffles = joinShuffles(executedPlan)
+        assert(shuffles.isEmpty,
+          s"Expected 0 join shuffles for semi-join with SPJ, but found: $shuffles")
       }
     }
   }
@@ -383,22 +470,22 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
       df2.write.format("delta").partitionBy("part").saveAsTable("t_outer2")
 
       withSPJConf(enabled = true) {
-        // Left Outer Join
         val leftQ = spark.sql(
-          "SELECT t1.id, t2.id, t1.part FROM t_outer1 t1 LEFT OUTER JOIN t_outer2 t2 ON t1.part = t2.part")
-        checkAnswer(leftQ, Seq((Some(1), None, "p1"), (Some(2), Some(20), "p2")).toDF("id1", "id2", "part"))
+          "SELECT t1.id, t2.id, t1.part FROM t_outer1 t1 " +
+            "LEFT OUTER JOIN t_outer2 t2 ON t1.part = t2.part")
+        checkAnswer(leftQ, Seq(Row(1, null, "p1"), Row(2, 20, "p2")))
         assertSPJPlan(leftQ, expectSPJ = true)
 
-        // Right Outer Join
         val rightQ = spark.sql(
-          "SELECT t1.id, t2.id, t2.part FROM t_outer1 t1 RIGHT OUTER JOIN t_outer2 t2 ON t1.part = t2.part")
-        checkAnswer(rightQ, Seq((Some(2), Some(20), "p2"), (None, Some(30), "p3")).toDF("id1", "id2", "part"))
+          "SELECT t1.id, t2.id, t2.part FROM t_outer1 t1 " +
+            "RIGHT OUTER JOIN t_outer2 t2 ON t1.part = t2.part")
+        checkAnswer(rightQ, Seq(Row(2, 20, "p2"), Row(null, 30, "p3")))
         assertSPJPlan(rightQ, expectSPJ = true)
 
-        // Full Outer Join
         val fullQ = spark.sql(
-          "SELECT t1.id, t2.id, COALESCE(t1.part, t2.part) FROM t_outer1 t1 FULL OUTER JOIN t_outer2 t2 ON t1.part = t2.part")
-        checkAnswer(fullQ, Seq((Some(1), None, "p1"), (Some(2), Some(20), "p2"), (None, Some(30), "p3")).toDF("id1", "id2", "part"))
+          "SELECT t1.id, t2.id, COALESCE(t1.part, t2.part) FROM t_outer1 t1 " +
+            "FULL OUTER JOIN t_outer2 t2 ON t1.part = t2.part")
+        checkAnswer(fullQ, Seq(Row(1, null, "p1"), Row(2, 20, "p2"), Row(null, 30, "p3")))
         assertSPJPlan(fullQ, expectSPJ = true)
       }
     }
@@ -406,7 +493,8 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
 
   test("E2E SPJ: Join keys subset of partition keys (allowJoinKeysSubsetOfPartitionKeys)") {
     withTable("t_sub1", "t_sub2") {
-      val df1 = Seq((1, "us", "ca"), (2, "us", "ny"), (3, "eu", "de")).toDF("id", "region", "state")
+      val df1 = Seq((1, "us", "ca"), (2, "us", "ny"), (3, "eu", "de"))
+        .toDF("id", "region", "state")
       val df2 = Seq((10, "us", "tx"), (20, "eu", "fr")).toDF("id", "region", "state")
 
       df1.write.format("delta").partitionBy("region", "state").saveAsTable("t_sub1")
@@ -418,7 +506,8 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
         ) {
           // Join only on `region` (subset of `(region, state)`)
           val query = spark.sql(
-            "SELECT t1.id, t2.id, t1.region FROM t_sub1 t1 JOIN t_sub2 t2 ON t1.region = t2.region")
+            "SELECT t1.id, t2.id, t1.region FROM t_sub1 t1 JOIN t_sub2 t2 " +
+              "ON t1.region = t2.region")
           checkAnswer(
             query,
             Seq((1, 10, "us"), (2, 10, "us"), (3, 20, "eu")).toDF("id1", "id2", "region")
@@ -439,12 +528,13 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
 
       withSPJConf(enabled = true) {
         val query = spark.sql(
-          "SELECT t1.id, t2.id, t1.part FROM t_prune1 t1 JOIN t_prune2 t2 ON t1.part = t2.part WHERE t1.part = 'p2'")
+          "SELECT t1.id, t2.id, t1.part FROM t_prune1 t1 JOIN t_prune2 t2 " +
+            "ON t1.part = t2.part WHERE t1.part = 'p2'")
         checkAnswer(query, Seq((2, 20, "p2")).toDF("id1", "id2", "part"))
         assertSPJPlan(query, expectSPJ = true)
 
-        val scans = query.queryExecution.executedPlan.collect { case b: BatchScanExec => b }
         // Verify partition pruning reduced planned partitions to 1 on each side
+        val scans = batchScans(query.queryExecution.executedPlan)
         assert(scans.forall(_.scan.asInstanceOf[DeltaBatchScan].planInputPartitions().length == 1),
           "Partition filter pushdown should prune scan to 1 partition")
       }
@@ -463,9 +553,12 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
       sql("DELETE FROM t_dv1 WHERE id = 2")
 
       withSPJConf(enabled = true) {
-        val query = spark.sql("SELECT t1.id, t2.id, t1.part FROM t_dv1 t1 JOIN t_dv2 t2 ON t1.part = t2.part")
+        val query = spark.sql(
+          "SELECT t1.id, t2.id, t1.part FROM t_dv1 t1 JOIN t_dv2 t2 ON t1.part = t2.part")
         // Verify deleted row id = 2 is NOT returned
         checkAnswer(query, Seq((1, 10, "p1"), (3, 30, "p2")).toDF("id1", "id2", "part"))
+        // Only the DV-free table is read through the V2 scan
+        assert(batchScans(query.queryExecution.executedPlan).size == 1)
       }
     }
   }
@@ -481,7 +574,8 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
       sql("INSERT INTO t_cm2 VALUES (10, 'p1'), (20, 'p2')")
 
       withSPJConf(enabled = true) {
-        val query = spark.sql("SELECT t1.id, t2.id, t1.part FROM t_cm1 t1 JOIN t_cm2 t2 ON t1.part = t2.part")
+        val query = spark.sql(
+          "SELECT t1.id, t2.id, t1.part FROM t_cm1 t1 JOIN t_cm2 t2 ON t1.part = t2.part")
         checkAnswer(query, Seq((1, 10, "p1"), (2, 20, "p2")).toDF("id1", "id2", "part"))
         assertSPJPlan(query, expectSPJ = true)
       }
@@ -497,8 +591,9 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
       df2.write.format("delta").partitionBy("part").saveAsTable("t_null2")
 
       withSPJConf(enabled = true) {
-        // Equality join on tables that contain NULL partition values should still eliminate shuffle
-        val query = spark.sql("SELECT t1.id, t2.id, t1.part FROM t_null1 t1 JOIN t_null2 t2 ON t1.part = t2.part")
+        // Equality join on tables containing NULL partition values should still avoid shuffle
+        val query = spark.sql(
+          "SELECT t1.id, t2.id, t1.part FROM t_null1 t1 JOIN t_null2 t2 ON t1.part = t2.part")
         checkAnswer(query, Seq((1, 10, "p1")).toDF("id1", "id2", "part"))
         assertSPJPlan(query, expectSPJ = true)
       }

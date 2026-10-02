@@ -264,9 +264,12 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
 
   val DELTA_STORAGE_PARTITIONED_JOIN_ENABLED =
     buildConf("storagePartitionedJoin.enabled")
-      .doc("When true, Delta Lake enables DataSource V2 reads for partitioned tables to support " +
-        "Spark Storage-Partitioned Join (SPJ), eliminating join shuffle exchanges when join keys " +
-        "match table partition columns.")
+      .doc("When true, reads of partitioned Delta tables use a DataSource V2 scan that reports " +
+        "the table's partitioning to Spark, enabling Storage-Partitioned Join (SPJ) to avoid " +
+        "shuffles when join/grouping keys match the table's partition columns. Requires " +
+        "spark.sql.sources.v2.bucketing.enabled=true. Tables with Deletion Vectors and CDC " +
+        "reads always use the V1 scan. The _metadata column is not supported when the V2 scan " +
+        "is used.")
       .booleanConf
       .createWithDefault(false)
 

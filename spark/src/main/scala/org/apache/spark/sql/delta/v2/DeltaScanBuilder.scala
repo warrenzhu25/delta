@@ -19,23 +19,29 @@ package org.apache.spark.sql.delta.v2
 import java.net.URI
 import java.util.Locale
 
-import org.apache.hadoop.fs.Path
+import scala.util.Try
 
-import org.apache.spark.paths.SparkPath
-import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Cast, GenericInternalRow, Literal}
-import org.apache.spark.sql.connector.expressions.{Expression => V2Expression, Expressions}
-import org.apache.spark.sql.connector.read._
-import org.apache.spark.sql.connector.read.partitioning.{KeyGroupedPartitioning, Partitioning, UnknownPartitioning}
 import org.apache.spark.sql.delta._
 import org.apache.spark.sql.delta.actions.{AddFile, Metadata, Protocol}
 import org.apache.spark.sql.delta.catalog.DeltaTableV2
+import org.apache.spark.sql.delta.logging.DeltaLogKeys
 import org.apache.spark.sql.delta.metering.DeltaLogging
-import org.apache.spark.sql.delta.sources.DeltaSQLConf
+import org.apache.spark.sql.delta.sources.{DeltaSourceUtils, DeltaSQLConf}
+import org.apache.hadoop.fs.Path
+
+import org.apache.spark.internal.MDC
+import org.apache.spark.paths.SparkPath
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
+import org.apache.spark.sql.catalyst.expressions.{Cast, Expression, GenericInternalRow, Literal}
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.connector.expressions.{Expression => V2Expression, Expressions}
+import org.apache.spark.sql.connector.read._
+import org.apache.spark.sql.connector.read.partitioning.{KeyGroupedPartitioning, Partitioning, UnknownPartitioning}
 import org.apache.spark.sql.execution.datasources.{FileFormat, PartitionedFile}
 import org.apache.spark.sql.sources.Filter
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{StructField, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.util.SerializableConfiguration
 
@@ -112,7 +118,6 @@ class DeltaBatchScan(
   private val snapshot: Snapshot = deltaTable.initialSnapshot
   private val protocol: Protocol = snapshot.protocol
   private val metadata: Metadata = snapshot.metadata
-  private val partitionColumns: Seq[String] = metadata.partitionColumns
 
   // scalastyle:off caselocale
   private lazy val readFieldNamesLower: Set[String] =
@@ -158,16 +163,14 @@ class DeltaBatchScan(
    * - Groups matching AddFiles by projected partition key when SPJ is eligible.
    */
   private lazy val plannedPartitions: Array[InputPartition] = {
-    val attrMap = org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes(tableSchema)
-      .map(a => a.name -> a).toMap
-    val catalystFilters = pushedFilters.flatMap { f =>
-      scala.util.Try(
-        org.apache.spark.sql.delta.sources.DeltaSourceUtils.translateFilters(Array(f))
-      ).toOption
+    val attrMap = DataTypeUtils.toAttributes(tableSchema).map(a => a.name -> a).toMap
+    // Filters that cannot be translated or resolved are skipped here; they are still applied
+    // by Spark after the scan since all pushed filters are reported as residuals.
+    val catalystFilters: Seq[Expression] = pushedFilters.toSeq.flatMap { f =>
+      Try(DeltaSourceUtils.translateFilters(Array(f))).toOption
     }.map { expr =>
       expr.transform {
-        case u: org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute =>
-          attrMap.getOrElse(u.name, u)
+        case u: UnresolvedAttribute => attrMap.getOrElse(u.name, u)
       }
     }.filter(_.resolved)
 
@@ -186,7 +189,7 @@ class DeltaBatchScan(
 
   private def extractPartitionRow(
       partValuesMap: Map[String, String],
-      schemaFields: Seq[org.apache.spark.sql.types.StructField]): GenericInternalRow = {
+      schemaFields: Seq[StructField]): GenericInternalRow = {
     val timeZone = spark.sessionState.conf.sessionLocalTimeZone
     val partitionRowValues = schemaFields.map { p =>
       val colPhysicalName = DeltaColumnMapping.getPhysicalName(p)
@@ -232,10 +235,13 @@ class DeltaBatchScan(
 
   override def planInputPartitions(): Array[InputPartition] = plannedPartitions
 
-  override def outputPartitioning(): Partitioning = {
+  override def outputPartitioning(): Partitioning = reportedPartitioning
+
+  private lazy val reportedPartitioning: Partitioning = {
     if (isSPJEligible) {
-      logInfo(s"Reporting KeyGroupedPartitioning by ${partitionColumns.mkString(", ")} " +
-        s"with ${plannedPartitions.length} partitions for table ${deltaTable.name()}")
+      logInfo(log"Reporting KeyGroupedPartitioning with " +
+        log"${MDC(DeltaLogKeys.NUM_PARTITIONS, plannedPartitions.length)} partitions for " +
+        log"table ${MDC(DeltaLogKeys.TABLE_NAME, deltaTable.name())}")
       new KeyGroupedPartitioning(groupingKeyTransforms, plannedPartitions.length)
     } else {
       new UnknownPartitioning(plannedPartitions.length)

@@ -33,6 +33,7 @@ import org.apache.spark.sql.delta.metering.{DeltaLogging, DeltaLoggingProvider}
 import org.apache.spark.sql.delta.sources.{DeltaDataSource, DeltaSourceUtils}
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.sources.DeltaSQLConf.ENABLE_TABLE_REDIRECT_FEATURE
+import org.apache.spark.sql.delta.v2.DeltaScanBuilder
 import com.databricks.spark.util.TagDefinition
 import org.apache.hadoop.fs.Path
 
@@ -280,12 +281,7 @@ class DeltaTableV2 private(
 
 
   override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
-    new org.apache.spark.sql.delta.v2.DeltaScanBuilder(
-      spark = spark,
-      deltaTable = this,
-      tableSchema = tableSchema,
-      options = options
-    )
+    new DeltaScanBuilder(spark, this, tableSchema, options)
   }
 
   override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder = {

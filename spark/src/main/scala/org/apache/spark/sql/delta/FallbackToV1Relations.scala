@@ -23,24 +23,41 @@ import org.apache.spark.sql.delta.sources.DeltaSQLConf
 
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
+import org.apache.spark.sql.internal.SQLConf
 
 /**
- * Fall back to V1 nodes unless DataSource V2 read is requested (e.g. for Storage-Partitioned Join).
+ * Fall back to V1 nodes, unless the DataSource V2 read path is enabled for Storage-Partitioned
+ * Join (SPJ) and the table can safely be read through it.
  */
 object FallbackToV1DeltaRelation {
   def unapply(dsv2: DataSourceV2Relation): Option[LogicalRelation] = dsv2.table match {
     case d: DeltaTableV2 if dsv2.getTagValue(DeltaRelation.KEEP_AS_V2_RELATION_TAG).isEmpty =>
-      val spjEnabled = d.spark.sessionState.conf.getConf(
-        DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_ENABLED)
-      val snapshot = d.initialSnapshot
-      val isPartitioned = snapshot.metadata.partitionColumns.nonEmpty
-      val isCDC = CDCReader.isCDCRead(dsv2.options)
-      val hasDeletionVectors = DeletionVectorUtils.deletionVectorsReadable(snapshot)
-      if (spjEnabled && isPartitioned && !isCDC && !hasDeletionVectors) {
+      if (shouldKeepAsV2ForSPJ(d, dsv2)) {
         None
       } else {
         Some(DeltaRelation.fromV2Relation(d, dsv2, dsv2.options))
       }
     case _ => None
+  }
+
+  /**
+   * Returns true if the relation should stay a [[DataSourceV2Relation]] so that it is planned as
+   * a `BatchScanExec` that reports `KeyGroupedPartitioning`. This requires:
+   *  - both Delta's SPJ flag and Spark's V2 bucketing flag to be enabled (otherwise the V2 scan
+   *    gives no benefit over the V1 scan);
+   *  - the table to be partitioned;
+   *  - not a CDC read, and no Deletion Vectors (not supported by the V2 scan yet).
+   * The cheap configuration checks are evaluated first to avoid loading the snapshot otherwise.
+   */
+  private def shouldKeepAsV2ForSPJ(d: DeltaTableV2, dsv2: DataSourceV2Relation): Boolean = {
+    val conf = d.spark.sessionState.conf
+    val enabled = conf.getConf(DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_ENABLED) &&
+      conf.getConf(SQLConf.V2_BUCKETING_ENABLED) &&
+      !CDCReader.isCDCRead(dsv2.options)
+    enabled && {
+      val snapshot = d.initialSnapshot
+      snapshot.metadata.partitionColumns.nonEmpty &&
+        !DeletionVectorUtils.deletionVectorsReadable(snapshot)
+    }
   }
 }
