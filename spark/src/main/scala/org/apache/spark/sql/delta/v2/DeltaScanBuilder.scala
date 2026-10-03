@@ -34,7 +34,7 @@ import org.apache.spark.paths.SparkPath
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
-import org.apache.spark.sql.catalyst.expressions.{Cast, Expression, GenericInternalRow, Literal}
+import org.apache.spark.sql.catalyst.expressions.{BoundReference, Cast, Expression, GenericInternalRow, Literal, UnsafeProjection}
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.connector.expressions.{Expression => V2Expression, Expressions}
 import org.apache.spark.sql.connector.read._
@@ -90,11 +90,10 @@ class DeltaScanBuilder(
  * Scan implementation for Delta Lake that reports [[KeyGroupedPartitioning]]
  * to enable Spark Storage-Partitioned Join (SPJ, SPARK-37375).
  *
- * For partitioned Delta tables where all partition columns are preserved in the readSchema
- * and SPJ is enabled via `spark.sql.sources.v2.bucketing.enabled = true` and
- * `spark.databricks.delta.storagePartitionedJoin.enabled = true`, this scan groups AddFiles
- * by their physical partition values into [[DeltaKeyGroupedInputPartition]]s that implement
- * [[HasPartitionKey]].
+ * When SPJ is enabled (`spark.databricks.delta.storagePartitionedJoin.enabled = true`) and at
+ * least one partition column is present in the readSchema, this scan groups AddFiles by the
+ * values of the partition columns present in the readSchema into
+ * [[DeltaKeyGroupedInputPartition]]s that implement [[HasPartitionKey]].
  */
 class DeltaBatchScan(
     val spark: SparkSession,
@@ -291,6 +290,12 @@ case class DeltaKeyGroupedInputPartition(
 /**
  * Factory for creating PartitionReaders for Delta tables in DSv2.
  * Uses [[DeltaParquetFileFormat]] to build Parquet file readers on the driver.
+ *
+ * Like the V1 `FileSourceScanExec`, partition columns are never read from the Parquet files
+ * (they may or may not be materialized there). Only the data columns of `readSchema` are
+ * requested from the file reader, which appends the partition values taken from the Delta log
+ * (`PartitionedFile.partitionValues`). The resulting `dataColumns ++ partitionColumns` row is
+ * then projected into `readSchema` order.
  */
 class DeltaPartitionReaderFactory(
     spark: SparkSession,
@@ -303,21 +308,60 @@ class DeltaPartitionReaderFactory(
     serializableHadoopConf: SerializableConfiguration)
   extends PartitionReaderFactory {
 
+  // scalastyle:off caselocale
+  private val readDataSchema: StructType = {
+    val partitionNames = partitionSchema.fieldNames.map(_.toLowerCase(Locale.ROOT)).toSet
+    StructType(readSchema.filterNot(f => partitionNames.contains(f.name.toLowerCase(Locale.ROOT))))
+  }
+  // scalastyle:on caselocale
+
+  /** Schema of the rows produced by the file reader: `readDataSchema ++ partitionSchema`. */
+  private val fileOutputSchema: StructType = StructType(readDataSchema ++ partitionSchema)
+
+  /** For each `readSchema` column, its ordinal in `fileOutputSchema`. Resolved on the driver. */
+  private val outputOrdinals: Array[Int] = {
+    val resolver = spark.sessionState.conf.resolver
+    readSchema.fieldNames.map { name =>
+      val idx = fileOutputSchema.fieldNames.indexWhere(resolver(_, name))
+      require(idx >= 0, s"Column $name not found in the file reader output")
+      idx
+    }
+  }
+
   private val parquetFormat = new DeltaParquetFileFormat(protocol, metadata)
+
+  /**
+   * Filters passed to the Parquet reader. Like V1, only filters on data columns are passed:
+   * partition columns are not read from the files, so Parquet would evaluate filters on them as
+   * NULL. Partition filters are already applied through Delta log pruning and by Spark after the
+   * scan.
+   */
+  // scalastyle:off caselocale
+  private val dataFilters: Seq[Filter] = {
+    val partitionNames = partitionSchema.fieldNames.map(_.toLowerCase(Locale.ROOT)).toSet
+    pushedFilters.toSeq.filterNot(_.references.exists(r =>
+      partitionNames.contains(r.toLowerCase(Locale.ROOT))))
+  }
+  // scalastyle:on caselocale
 
   private val readerBuilder = parquetFormat.buildReaderWithPartitionValues(
     sparkSession = spark,
     dataSchema = dataSchema,
     partitionSchema = partitionSchema,
-    requiredSchema = readSchema,
-    filters = pushedFilters.toSeq,
+    requiredSchema = readDataSchema,
+    filters = dataFilters,
     options = Map(FileFormat.OPTION_RETURNING_BATCH -> "false"),
     hadoopConf = serializableHadoopConf.value
   )
 
   override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
     val deltaPartition = partition.asInstanceOf[DeltaKeyGroupedInputPartition]
-    new DeltaBatchPartitionReader(deltaPartition, readerBuilder)
+    val outputExprs = outputOrdinals.toSeq.map { i =>
+      val f = fileOutputSchema(i)
+      BoundReference(i, f.dataType, f.nullable)
+    }
+    val projection = UnsafeProjection.create(outputExprs)
+    new DeltaBatchPartitionReader(deltaPartition, readerBuilder, projection)
   }
 }
 
@@ -327,7 +371,8 @@ class DeltaPartitionReaderFactory(
  */
 class DeltaBatchPartitionReader(
     partition: DeltaKeyGroupedInputPartition,
-    readerBuilder: PartitionedFile => Iterator[InternalRow])
+    readerBuilder: PartitionedFile => Iterator[InternalRow],
+    projection: UnsafeProjection)
   extends PartitionReader[InternalRow] {
 
   private val fileIterator: Iterator[DeltaScanFileInfo] = partition.files.iterator
@@ -365,7 +410,7 @@ class DeltaBatchPartitionReader(
   }
 
   override def get(): InternalRow = {
-    currentFileReader.get.next()
+    projection(currentFileReader.get.next())
   }
 
   override def close(): Unit = {

@@ -222,6 +222,26 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
     }
   }
 
+  test("Partition values are read from the Delta log when not materialized in Parquet files") {
+    withTable("t_nomat1", "t_nomat2") {
+      Seq("t_nomat1", "t_nomat2").foreach { t =>
+        sql(s"CREATE TABLE $t (part STRING, id INT, v STRING) USING delta PARTITIONED BY (part) " +
+          "TBLPROPERTIES ('delta.writePartitionColumnsToParquet' = 'false')")
+      }
+      sql("INSERT INTO t_nomat1 VALUES ('a', 1, 'x'), ('b', 2, 'y')")
+      sql("INSERT INTO t_nomat2 VALUES ('a', 10, 'p'), ('b', 20, 'q')")
+
+      withSPJConf(enabled = true) {
+        checkAnswer(sql("SELECT * FROM t_nomat1"), Seq(Row("a", 1, "x"), Row("b", 2, "y")))
+        checkAnswer(sql("SELECT id, part FROM t_nomat1"), Seq(Row(1, "a"), Row(2, "b")))
+        val query = sql(
+          "SELECT t1.id, t2.id, t1.part FROM t_nomat1 t1 JOIN t_nomat2 t2 ON t1.part = t2.part")
+        checkAnswer(query, Seq(Row(1, 10, "a"), Row(2, 20, "b")))
+        assertSPJPlan(query, expectSPJ = true)
+      }
+    }
+  }
+
   test("Partition column that is not the last column in the schema") {
     withTable("t_order") {
       sql("CREATE TABLE t_order (part STRING, id INT, v STRING) USING delta PARTITIONED BY (part)")
