@@ -267,11 +267,18 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .doc("When true, reads of partitioned Delta tables use a DataSource V2 scan that reports " +
         "the table's partitioning to Spark, enabling Storage-Partitioned Join (SPJ) to avoid " +
         "shuffles when join/grouping keys match the table's partition columns. Requires " +
-        "spark.sql.sources.v2.bucketing.enabled=true. Tables with Deletion Vectors and CDC " +
-        "reads always use the V1 scan. The _metadata column is not supported when the V2 scan " +
-        "is used.")
+        "spark.sql.sources.v2.bucketing.enabled=true. CDC reads always use the V1 scan. The " +
+        "_metadata column is not supported when the V2 scan is used.")
       .booleanConf
       .createWithDefault(false)
+
+  val DELTA_STORAGE_PARTITIONED_JOIN_DELETION_VECTORS_ENABLED =
+    buildConf("storagePartitionedJoin.deletionVectors.enabled")
+      .internal()
+      .doc("When true, tables with Deletion Vectors can be read by the Storage-Partitioned Join " +
+        "V2 scan, which filters deleted rows itself. When false, such tables use the V1 scan.")
+      .booleanConf
+      .createWithDefault(true)
 
   val DELTA_COMMIT_VALIDATION_ENABLED =
     buildConf("commitValidation.enabled")

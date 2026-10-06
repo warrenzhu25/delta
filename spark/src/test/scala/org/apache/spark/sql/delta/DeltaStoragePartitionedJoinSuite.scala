@@ -23,6 +23,7 @@ import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
 import org.apache.spark.sql.delta.v2.DeltaBatchScan
 
 import org.apache.spark.sql.{DataFrame, QueryTest, Row}
+import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.plans.physical.RangePartitioning
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
@@ -561,24 +562,151 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
     }
   }
 
-  test("Deletion Vector enabled table safely falls back to V1 and filters deleted rows") {
-    withTable("t_dv1", "t_dv2") {
-      sql("CREATE TABLE t_dv1 (id INT, part STRING) USING delta PARTITIONED BY (part) " +
-        "TBLPROPERTIES ('delta.enableDeletionVectors' = 'true')")
-      sql("CREATE TABLE t_dv2 (id INT, part STRING) USING delta PARTITIONED BY (part)")
+  private def numFilesWithDVs(table: String): Long =
+    DeltaLog.forTable(spark, TableIdentifier(table)).update().allFiles
+      .filter("deletionVector IS NOT NULL").count()
 
-      sql("INSERT INTO t_dv1 VALUES (1, 'p1'), (2, 'p1'), (3, 'p2')")
-      sql("INSERT INTO t_dv2 VALUES (10, 'p1'), (30, 'p2')")
-      // Delete one row from p1 to generate a Deletion Vector
+  /** Checks that `query` returns the same rows as the V1 reader and is planned with SPJ. */
+  private def checkSPJAnswerMatchesV1(query: String): Unit = {
+    val expected = withSPJConf(enabled = false) { sql(query).collect().toSeq }
+    withSPJConf(enabled = true) {
+      val df = sql(query)
+      checkAnswer(df, expected)
+      assertSPJPlan(df, expectSPJ = true)
+    }
+  }
+
+  /** Inserts rows with a single task, so each partition gets one file and DELETEs write DVs. */
+  private def insertValues(table: String, values: String): Unit =
+    sql(s"INSERT INTO $table SELECT /*+ REPARTITION(1) */ * FROM VALUES $values")
+
+  private def createDVTable(name: String, extraProps: String = ""): Unit = {
+    sql(s"CREATE TABLE $name (id INT, v STRING, part STRING) USING delta PARTITIONED BY (part) " +
+      s"TBLPROPERTIES ('delta.enableDeletionVectors' = 'true'$extraProps)")
+  }
+
+  for {
+    useMetadataRowIndex <- Seq(true, false)
+    vectorized <- Seq(true, false)
+  } test(s"SPJ filters rows deleted by Deletion Vectors - " +
+      s"useMetadataRowIndex=$useMetadataRowIndex, vectorized=$vectorized") {
+    withSQLConf(
+      DeltaSQLConf.DELETION_VECTORS_USE_METADATA_ROW_INDEX.key -> useMetadataRowIndex.toString,
+      SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> vectorized.toString) {
+      withTable("t_dv1", "t_dv2") {
+        createDVTable("t_dv1")
+        createDVTable("t_dv2")
+        insertValues("t_dv1", "(1, 'a', 'p1'), (2, 'b', 'p1'), (3, 'c', 'p1'), " +
+          "(4, 'd', 'p2'), (5, 'e', 'p2'), (6, 'f', 'p3')")
+        insertValues("t_dv2", "(10, 'x', 'p1'), (20, 'y', 'p2'), (21, 'z', 'p2'), " +
+          "(30, 'w', 'p3')")
+        sql("DELETE FROM t_dv1 WHERE id IN (2, 5)")
+        sql("DELETE FROM t_dv2 WHERE id = 21")
+        assert(numFilesWithDVs("t_dv1") == 2)
+        assert(numFilesWithDVs("t_dv2") == 1)
+
+        val query = "SELECT t1.id, t1.v, t2.id, t2.v, t1.part FROM t_dv1 t1 JOIN t_dv2 t2 " +
+          "ON t1.part = t2.part"
+        checkSPJAnswerMatchesV1(query)
+        withSPJConf(enabled = true) {
+          checkAnswer(sql(query), Seq(
+            Row(1, "a", 10, "x", "p1"), Row(3, "c", 10, "x", "p1"),
+            Row(4, "d", 20, "y", "p2"), Row(6, "f", 30, "w", "p3")))
+        }
+      }
+    }
+  }
+
+  test("SPJ on Deletion Vector tables after multiple DELETEs and UPDATE") {
+    withTable("t_dv1", "t_dv2") {
+      createDVTable("t_dv1")
+      createDVTable("t_dv2")
+      sql("INSERT INTO t_dv1 SELECT /*+ REPARTITION(1) */ id, CAST(id AS STRING), " +
+        "CONCAT('p', id % 3) FROM range(30)")
+      sql("INSERT INTO t_dv2 SELECT /*+ REPARTITION(1) */ id, CAST(id AS STRING), " +
+        "CONCAT('p', id % 3) FROM range(30)")
+      sql("DELETE FROM t_dv1 WHERE id % 5 = 0")
+      sql("DELETE FROM t_dv1 WHERE id % 7 = 0")
+      sql("UPDATE t_dv2 SET v = 'updated' WHERE id % 4 = 0")
+      assert(numFilesWithDVs("t_dv1") > 0)
+      assert(numFilesWithDVs("t_dv2") > 0)
+
+      checkSPJAnswerMatchesV1("SELECT t1.id, t2.id, t2.v, t1.part FROM t_dv1 t1 " +
+        "JOIN t_dv2 t2 ON t1.part = t2.part AND t1.id = t2.id")
+      checkSPJAnswerMatchesV1("SELECT part, count(*), sum(id) FROM t_dv1 GROUP BY part " +
+        "ORDER BY part") // single table read with DVs; no join shuffle expected
+    }
+  }
+
+  test("SPJ on Deletion Vector table with DVs in some partitions and a partition filter") {
+    withTable("t_dv1", "t_dv2") {
+      createDVTable("t_dv1")
+      createDVTable("t_dv2")
+      insertValues("t_dv1", "(1, 'a', 'p1'), (2, 'b', 'p1'), (3, 'c', 'p2'), " +
+        "(4, 'd', 'p2'), (5, 'e', 'p3')")
+      insertValues("t_dv2", "(10, 'x', 'p1'), (20, 'y', 'p2'), (30, 'z', 'p3')")
+      // Only partition p2 gets a DV.
+      sql("DELETE FROM t_dv1 WHERE id = 4")
+      assert(numFilesWithDVs("t_dv1") == 1)
+
+      checkSPJAnswerMatchesV1("SELECT t1.id, t2.id, t1.part FROM t_dv1 t1 JOIN t_dv2 t2 " +
+        "ON t1.part = t2.part")
+      // The DV-free partition alone.
+      checkSPJAnswerMatchesV1("SELECT t1.id, t2.id, t1.part FROM t_dv1 t1 JOIN t_dv2 t2 " +
+        "ON t1.part = t2.part WHERE t1.part = 'p1'")
+      // The partition with the DV alone.
+      checkSPJAnswerMatchesV1("SELECT t1.id, t2.id, t1.part FROM t_dv1 t1 JOIN t_dv2 t2 " +
+        "ON t1.part = t2.part WHERE t1.part = 'p2'")
+      // Data filter on a column of the table with DVs.
+      checkSPJAnswerMatchesV1("SELECT t1.id, t2.id, t1.part FROM t_dv1 t1 JOIN t_dv2 t2 " +
+        "ON t1.part = t2.part WHERE t1.id > 2")
+    }
+  }
+
+  test("SPJ on Deletion Vector enabled table without any DV") {
+    withTable("t_dv1", "t_dv2") {
+      createDVTable("t_dv1")
+      sql("CREATE TABLE t_dv2 (id INT, part STRING) USING delta PARTITIONED BY (part)")
+      insertValues("t_dv1", "(1, 'a', 'p1'), (2, 'b', 'p2')")
+      insertValues("t_dv2", "(10, 'p1'), (20, 'p2')")
+      assert(numFilesWithDVs("t_dv1") == 0)
+      checkSPJAnswerMatchesV1("SELECT t1.id, t2.id, t1.part FROM t_dv1 t1 JOIN t_dv2 t2 " +
+        "ON t1.part = t2.part")
+    }
+  }
+
+  test("SPJ on Deletion Vector tables with column mapping") {
+    withTable("t_dv1", "t_dv2") {
+      val cm = ", 'delta.columnMapping.mode' = 'name'"
+      createDVTable("t_dv1", cm)
+      createDVTable("t_dv2", cm)
+      insertValues("t_dv1", "(1, 'a', 'p1'), (2, 'b', 'p1'), (3, 'c', 'p2')")
+      insertValues("t_dv2", "(10, 'x', 'p1'), (20, 'y', 'p2')")
+      sql("ALTER TABLE t_dv1 RENAME COLUMN v TO v_renamed")
+      sql("DELETE FROM t_dv1 WHERE id = 1")
+      assert(numFilesWithDVs("t_dv1") == 1)
+      checkSPJAnswerMatchesV1("SELECT t1.id, t1.v_renamed, t2.id, t1.part FROM t_dv1 t1 " +
+        "JOIN t_dv2 t2 ON t1.part = t2.part")
+    }
+  }
+
+  test("Deletion Vector tables fall back to V1 when DV support is disabled") {
+    withTable("t_dv1", "t_dv2") {
+      createDVTable("t_dv1")
+      sql("CREATE TABLE t_dv2 (id INT, part STRING) USING delta PARTITIONED BY (part)")
+      insertValues("t_dv1", "(1, 'a', 'p1'), (2, 'b', 'p1'), (3, 'c', 'p2')")
+      insertValues("t_dv2", "(10, 'p1'), (30, 'p2')")
       sql("DELETE FROM t_dv1 WHERE id = 2")
 
       withSPJConf(enabled = true) {
-        val query = spark.sql(
-          "SELECT t1.id, t2.id, t1.part FROM t_dv1 t1 JOIN t_dv2 t2 ON t1.part = t2.part")
-        // Verify deleted row id = 2 is NOT returned
-        checkAnswer(query, Seq((1, 10, "p1"), (3, 30, "p2")).toDF("id1", "id2", "part"))
-        // Only the DV-free table is read through the V2 scan
-        assert(batchScans(query.queryExecution.executedPlan).size == 1)
+        withSQLConf(
+          DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_DELETION_VECTORS_ENABLED.key -> "false") {
+          val query = spark.sql(
+            "SELECT t1.id, t2.id, t1.part FROM t_dv1 t1 JOIN t_dv2 t2 ON t1.part = t2.part")
+          checkAnswer(query, Seq((1, 10, "p1"), (3, 30, "p2")).toDF("id1", "id2", "part"))
+          // Only the DV-free table is read through the V2 scan.
+          assert(batchScans(query.queryExecution.executedPlan).size == 1)
+        }
       }
     }
   }

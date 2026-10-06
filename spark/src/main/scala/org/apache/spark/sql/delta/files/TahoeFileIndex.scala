@@ -123,23 +123,7 @@ abstract class TahoeFileIndex(
       /* blockSize */ 1,
       /* modificationTime */ addFile.modificationTime,
       /* path */ absolutePath(addFile.path))
-    val metadata = mutable.Map.empty[String, Any]
-    addFile.baseRowId.foreach(baseRowId => metadata.put(RowId.BASE_ROW_ID, baseRowId))
-    addFile.defaultRowCommitVersion.foreach(defaultRowCommitVersion =>
-      metadata.put(DefaultRowCommitVersion.METADATA_STRUCT_FIELD_NAME, defaultRowCommitVersion))
-
-    if (addFile.deletionVector != null) {
-      metadata.put(DeltaParquetFileFormat.FILE_ROW_INDEX_FILTER_ID_ENCODED,
-        addFile.deletionVector.serializeToBase64())
-
-      // Set the filter type to IF_CONTAINED by default to let [[DeltaParquetFileFormat]] filter
-      // out rows unless a filter type was explicitly provided in rowIndexFilters. This can happen
-      // e.g. when reading CDC data to keep deleted rows instead of filtering them out.
-      val filterType = rowIndexFilters.getOrElse(Map.empty)
-        .getOrElse(addFile.path, RowIndexFilterType.IF_CONTAINED)
-      metadata.put(DeltaParquetFileFormat.FILE_ROW_INDEX_FILTER_TYPE, filterType)
-    }
-    FileStatusWithMetadata(fs, metadata.toMap)
+    FileStatusWithMetadata(fs, TahoeFileIndex.constantMetadataForFile(addFile, rowIndexFilters))
   }
 
   private[delta] def makePartitionDirectories(
@@ -200,6 +184,35 @@ abstract class TahoeFileIndex(
    */
   def getBasePath(filePath: Path): Option[Path] = Some(path)
 
+}
+
+object TahoeFileIndex {
+  /**
+   * Per-file constant metadata passed to [[DeltaParquetFileFormat]] through
+   * `PartitionedFile.otherConstantMetadataColumnValues`: row tracking base values and, for files
+   * with a Deletion Vector, the serialized DV descriptor and the row index filter type.
+   */
+  def constantMetadataForFile(
+      addFile: AddFile,
+      rowIndexFilters: Option[Map[String, RowIndexFilterType]]): Map[String, Any] = {
+    val metadata = mutable.Map.empty[String, Any]
+    addFile.baseRowId.foreach(baseRowId => metadata.put(RowId.BASE_ROW_ID, baseRowId))
+    addFile.defaultRowCommitVersion.foreach(defaultRowCommitVersion =>
+      metadata.put(DefaultRowCommitVersion.METADATA_STRUCT_FIELD_NAME, defaultRowCommitVersion))
+
+    if (addFile.deletionVector != null) {
+      metadata.put(DeltaParquetFileFormat.FILE_ROW_INDEX_FILTER_ID_ENCODED,
+        addFile.deletionVector.serializeToBase64())
+
+      // Set the filter type to IF_CONTAINED by default to let [[DeltaParquetFileFormat]] filter
+      // out rows unless a filter type was explicitly provided in rowIndexFilters. This can happen
+      // e.g. when reading CDC data to keep deleted rows instead of filtering them out.
+      val filterType = rowIndexFilters.getOrElse(Map.empty)
+        .getOrElse(addFile.path, RowIndexFilterType.IF_CONTAINED)
+      metadata.put(DeltaParquetFileFormat.FILE_ROW_INDEX_FILTER_TYPE, filterType)
+    }
+    metadata.toMap
+  }
 }
 
 /** A [[TahoeFileIndex]] that works with a specific [[SnapshotDescriptor]]. */

@@ -46,7 +46,8 @@ object FallbackToV1DeltaRelation {
    *  - both Delta's SPJ flag and Spark's V2 bucketing flag to be enabled (otherwise the V2 scan
    *    gives no benefit over the V1 scan);
    *  - the table to be partitioned;
-   *  - not a CDC read, and no Deletion Vectors (not supported by the V2 scan yet).
+   *  - not a CDC read;
+   *  - no Deletion Vectors, unless DV support in the V2 scan is enabled.
    * The cheap configuration checks are evaluated first to avoid loading the snapshot otherwise.
    */
   private def shouldKeepAsV2ForSPJ(d: DeltaTableV2, dsv2: DataSourceV2Relation): Boolean = {
@@ -57,7 +58,8 @@ object FallbackToV1DeltaRelation {
     enabled && {
       val snapshot = d.initialSnapshot
       snapshot.metadata.partitionColumns.nonEmpty &&
-        !DeletionVectorUtils.deletionVectorsReadable(snapshot)
+        (conf.getConf(DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_DELETION_VECTORS_ENABLED) ||
+          !DeletionVectorUtils.deletionVectorsReadable(snapshot))
     }
   }
 }

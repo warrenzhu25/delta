@@ -21,6 +21,7 @@ can understand the change without reading the diff side by side.
    - [6.2 `FallbackToV1Relations.scala`: when to keep the V2 relation](#62-fallbacktov1relationsscala-when-to-keep-the-v2-relation)
    - [6.3 `DeltaTableV2.scala`: `SupportsRead`](#63-deltatablev2scala-supportsread)
    - [6.4 `v2/DeltaScanBuilder.scala`: the V2 scan](#64-v2deltascanbuilderscala-the-v2-scan)
+   - [6.5 Deletion Vector support](#65-deletion-vector-support)
 7. [Design Details & Invariants](#7-design-details--invariants)
 8. [Behavior Matrix](#8-behavior-matrix)
 9. [Limitations](#9-limitations)
@@ -49,7 +50,8 @@ with no shuffle. This works for inner, left, right, full outer, semi and anti jo
 removes the shuffle for aggregations grouped by the partition columns.
 
 This change adds an **opt-in** DataSource V2 read path for partitioned Delta tables that supports
-SPJ.
+SPJ. Tables with **Deletion Vectors** are supported: the V2 reader filters deleted rows the same
+way the V1 reader does (6.5).
 
 ---
 
@@ -94,11 +96,12 @@ have to sort its partitions.
 
 | File | Change | Lines |
 | :--- | :--- | :--- |
-| `spark/src/main/scala/org/apache/spark/sql/delta/sources/DeltaSQLConf.scala` | New conf `storagePartitionedJoin.enabled` | +11 |
-| `spark/src/main/scala/org/apache/spark/sql/delta/FallbackToV1Relations.scala` | Keep V2 relation when the table qualifies | +34 / -1 |
+| `spark/src/main/scala/org/apache/spark/sql/delta/sources/DeltaSQLConf.scala` | New confs `storagePartitionedJoin.enabled` and (internal) `storagePartitionedJoin.deletionVectors.enabled` | +18 |
+| `spark/src/main/scala/org/apache/spark/sql/delta/FallbackToV1Relations.scala` | Keep V2 relation when the table qualifies | +36 / -1 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/catalog/DeltaTableV2.scala` | `with SupportsRead`, `newScanBuilder` | +8 / -1 |
-| `spark/src/main/scala/org/apache/spark/sql/delta/v2/DeltaScanBuilder.scala` | **New.** Scan builder, scan, input partition, reader factory, reader | ~400 |
-| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 24 tests | ~620 |
+| `spark/src/main/scala/org/apache/spark/sql/delta/files/TahoeFileIndex.scala` | Per-file constant metadata (row tracking, DV descriptor) moved into a reusable `TahoeFileIndex.constantMetadataForFile` | +30 / -17 |
+| `spark/src/main/scala/org/apache/spark/sql/delta/v2/DeltaScanBuilder.scala` | **New.** Scan builder, scan, input partition, reader factory, reader (with DV filtering) | ~500 |
+| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 32 tests | ~740 |
 
 No other code paths change when the conf is `false`. The only extra work is two conf lookups per
 Delta relation during analysis.
@@ -118,7 +121,7 @@ sequenceDiagram
     participant Exec as DeltaPartitionReaderFactory / DeltaBatchPartitionReader
 
     User->>Analysis: SELECT ... FROM t1 JOIN t2 ON t1.region = t2.region
-    Analysis->>Analysis: shouldKeepAsV2ForSPJ?<br/>confs on, not CDC, partitioned, no DVs
+    Analysis->>Analysis: shouldKeepAsV2ForSPJ?<br/>confs on, not CDC, partitioned
     alt Eligible
         Analysis-->>TableV2: keep DataSourceV2Relation
         Planner->>TableV2: newScanBuilder(options)
@@ -134,7 +137,7 @@ sequenceDiagram
         Planner->>Planner: Both sides key-grouped on region:<br/>no ShuffleExchangeExec
         Planner->>Scan: createReaderFactory()
         Scan-->>Exec: DeltaPartitionReaderFactory (driver builds Parquet reader fn)
-        Exec->>Exec: per task: read each file in the group,<br/>add partition values, project to readSchema
+        Exec->>Exec: per task: read each file in the group,<br/>skip rows deleted by DVs,<br/>add partition values, project to readSchema
     else Not eligible
         Analysis-->>TableV2: replace with V1 LogicalRelation (unchanged behavior)
     end
@@ -152,11 +155,18 @@ val DELTA_STORAGE_PARTITIONED_JOIN_ENABLED =
     .doc("When true, reads of partitioned Delta tables use a DataSource V2 scan that reports " +
       "the table's partitioning to Spark, enabling Storage-Partitioned Join (SPJ) to avoid " +
       "shuffles when join/grouping keys match the table's partition columns. Requires " +
-      "spark.sql.sources.v2.bucketing.enabled=true. Tables with Deletion Vectors and CDC " +
-      "reads always use the V1 scan. The _metadata column is not supported when the V2 scan " +
-      "is used.")
+      "spark.sql.sources.v2.bucketing.enabled=true. CDC reads always use the V1 scan. The " +
+      "_metadata column is not supported when the V2 scan is used.")
     .booleanConf
     .createWithDefault(false)
+
+val DELTA_STORAGE_PARTITIONED_JOIN_DELETION_VECTORS_ENABLED =
+  buildConf("storagePartitionedJoin.deletionVectors.enabled")
+    .internal()
+    .doc("When true, tables with Deletion Vectors can be read by the Storage-Partitioned Join " +
+      "V2 scan, which filters deleted rows itself. When false, such tables use the V1 scan.")
+    .booleanConf
+    .createWithDefault(true)
 ```
 
 - `buildConf` adds the `spark.databricks.delta.` prefix, so the full key is
@@ -165,6 +175,9 @@ val DELTA_STORAGE_PARTITIONED_JOIN_ENABLED =
 - It is a public (non-`internal()`) conf because users have to set it themselves.
 - The doc string lists the prerequisites and the known limitation, so users see them in
   `SET -v` output.
+- `storagePartitionedJoin.deletionVectors.enabled` is an internal kill switch for DV support
+  (6.5). It defaults to `true`; setting it to `false` sends tables with Deletion Vectors back to
+  V1 while other partitioned tables keep using the V2 scan.
 
 ### 6.2 `FallbackToV1Relations.scala`: when to keep the V2 relation
 
@@ -203,7 +216,8 @@ object FallbackToV1DeltaRelation {
     enabled && {
       val snapshot = d.initialSnapshot                                                 // (6)
       snapshot.metadata.partitionColumns.nonEmpty &&                                   // (7)
-        !DeletionVectorUtils.deletionVectorsReadable(snapshot)                         // (8)
+        (conf.getConf(DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_DELETION_VECTORS_ENABLED) ||
+          !DeletionVectorUtils.deletionVectorsReadable(snapshot))                     // (8)
     }
   }
 }
@@ -223,9 +237,9 @@ doesn't match, so the `DataSourceV2Relation` stays in the plan.
 6. **The snapshot is loaded only if 3–5 pass.** `initialSnapshot` is a lazy val that may read the
    Delta log, so it isn't touched when the feature is off.
 7. **Unpartitioned tables** have nothing to report, so they stay on V1.
-8. **Deletion Vectors:** the V2 reader doesn't apply DV bitmaps (see 7.5). This is a check on the
-   protocol/table feature, so it is conservative. A table with DVs enabled stays on V1 even if no
-   rows have been deleted yet.
+8. **Deletion Vectors:** the V2 reader filters deleted rows (6.5), so DV tables stay V2 by
+   default. Only when the internal kill switch `storagePartitionedJoin.deletionVectors.enabled`
+   is `false` do tables with readable DVs fall back to V1.
 
 **What doesn't change:**
 
@@ -336,7 +350,7 @@ class DeltaBatchScan(val spark, val deltaTable, val tableSchema, val readSchema,
 #### 6.4.3 `DeltaBatchScan.plannedPartitions`: pruning and grouping
 
 ```scala
-private lazy val plannedPartitions: Array[InputPartition] = {
+private lazy val selectedFiles: Seq[AddFile] = {
   // (a) Convert pushed V1 Filters to resolved Catalyst expressions
   val attrMap = DataTypeUtils.toAttributes(tableSchema).map(a => a.name -> a).toMap
   val catalystFilters: Seq[Expression] = pushedFilters.toSeq.flatMap { f =>
@@ -346,17 +360,24 @@ private lazy val plannedPartitions: Array[InputPartition] = {
   }.filter(_.resolved)
 
   // (b) Delta log pruning: partition pruning + data skipping
-  val addFiles: Seq[AddFile] = snapshot.filesForScan(catalystFilters).files
+  snapshot.filesForScan(catalystFilters).files
+}
 
+// Used by the reader factory to decide whether DV filtering is needed (6.5)
+private lazy val hasDeletionVectors: Boolean =
+  DeletionVectorUtils.deletionVectorsReadable(snapshot) &&
+    selectedFiles.exists(_.deletionVector != null)
+
+private lazy val plannedPartitions: Array[InputPartition] = {
   // (c) Group files by partition key
   if (isSPJEligible) {
     val projectedPhysicalCols = projectedPartitionFields.map(DeltaColumnMapping.getPhysicalName)
-    val grouped = addFiles.groupBy { f =>
+    val grouped = selectedFiles.groupBy { f =>
       projectedPhysicalCols.map(col => col -> f.partitionValues.getOrElse(col, null)).toMap
     }.toSeq
     planPartitions(grouped)
   } else {
-    planPartitions(addFiles.map(f => (f.partitionValues, Seq(f))))   // one split per file
+    planPartitions(selectedFiles.map(f => (f.partitionValues, Seq(f))))   // one split per file
   }
 }
 ```
@@ -373,8 +394,11 @@ private lazy val plannedPartitions: Array[InputPartition] = {
   *projected* partition columns only. Files from different full partitions (`US/CA`, `US/NY`)
   share a group when only `region` is projected. The `else` branch makes one split per file when
   SPJ doesn't apply.
-- It is a `lazy val`, so the Delta log is scanned once per scan, even though Spark calls both
-  `outputPartitioning()` and `planInputPartitions()`.
+- `selectedFiles` and `plannedPartitions` are `lazy val`s, so the Delta log is scanned once per
+  scan, even though Spark calls `outputPartitioning()`, `planInputPartitions()` and
+  `createReaderFactory()`.
+- `selectedFiles` is separate from the grouping so that `hasDeletionVectors` can inspect the same
+  pruned file list (6.5).
 
 #### 6.4.4 Turning partition strings into typed rows
 
@@ -407,7 +431,8 @@ private def planPartitions(groups: Seq[(Map[String, String], Seq[AddFile])]): Ar
         path = resolveFilePath(f.path),
         size = f.size,
         modificationTime = f.modificationTime,
-        partitionValues = extractPartitionRow(f.partitionValues, metadata.partitionSchema))
+        partitionValues = extractPartitionRow(f.partitionValues, metadata.partitionSchema),
+        constantMetadata = TahoeFileIndex.constantMetadataForFile(f, rowIndexFilters = None))
     }.toArray
     DeltaKeyGroupedInputPartition(idx, fileInfos, groupingKeyRow): InputPartition
   }.toArray
@@ -420,6 +445,9 @@ private def planPartitions(groups: Seq[(Map[String, String], Seq[AddFile])]): Ar
 - **`resolveFilePath`:** `AddFile.path` is usually relative (URL-encoded, e.g. `part=a/x.parquet`).
   It is parsed as a URI and made absolute against `deltaLog.dataPath`, just like
   `TahoeFileIndex.absolutePath`. Absolute paths (shallow clones, for example) are kept as they are.
+- **`constantMetadata`:** per-file values the file format reads from
+  `PartitionedFile.otherConstantMetadataColumnValues`, built by the same helper V1 uses (6.5.1).
+  For a file with a DV it holds the serialized DV descriptor.
 
 #### 6.4.6 Reporting partitioning
 
@@ -446,7 +474,8 @@ private lazy val reportedPartitioning: Partitioning =
 
 ```scala
 case class DeltaScanFileInfo(path: String, size: Long, modificationTime: Long,
-    partitionValues: InternalRow) extends Serializable
+    partitionValues: InternalRow,
+    constantMetadata: Map[String, Any] = Map.empty) extends Serializable
 
 case class DeltaKeyGroupedInputPartition(partitionId: Int, files: Array[DeltaScanFileInfo],
     partitionKeyInternalRow: InternalRow)
@@ -460,6 +489,9 @@ case class DeltaKeyGroupedInputPartition(partitionId: Int, files: Array[DeltaSca
   sides of a join.
 
 #### 6.4.8 `DeltaPartitionReaderFactory`: building the Parquet reader
+
+The snippet below shows the reader for a table without Deletion Vectors. The extra DV parameters
+(`deletionVectorTablePath`, `useMetadataRowIndex`) and the columns they add are covered in 6.5.2.
 
 ```scala
 class DeltaPartitionReaderFactory(spark, dataSchema, partitionSchema, readSchema,
@@ -535,10 +567,11 @@ class DeltaPartitionReaderFactory(spark, dataSchema, partitionSchema, readSchema
 #### 6.4.9 `DeltaBatchPartitionReader`: reading a group of files
 
 ```scala
-class DeltaBatchPartitionReader(partition, readerBuilder, projection)
+class DeltaBatchPartitionReader(partition, readerBuilder, projection, isRowDeletedOrdinal = -1)
   extends PartitionReader[InternalRow] {
   private val fileIterator = partition.files.iterator
   private var currentFileReader: Option[Iterator[InternalRow]] = None
+  private var currentRow: InternalRow = _
 
   private def closeCurrentFileReader(): Unit = {
     currentFileReader.foreach { case c: AutoCloseable => c.close(); case _ => }
@@ -551,26 +584,181 @@ class DeltaBatchPartitionReader(partition, readerBuilder, projection)
       val fi = fileIterator.next()
       currentFileReader = Some(readerBuilder(PartitionedFile(
         partitionValues = fi.partitionValues, filePath = SparkPath.fromPathString(fi.path),
-        start = 0, length = fi.size)))                                       // whole file, no split
+        start = 0, length = fi.size,                                         // whole file, no split
+        otherConstantMetadataColumnValues = fi.constantMetadata)))           // DV descriptor etc.
     }
     currentFileReader.exists(_.hasNext)
   }
 
-  override def next(): Boolean =
-    if (currentFileReader.exists(_.hasNext)) true else advanceToNextFile()
-  override def get(): InternalRow = projection(currentFileReader.get.next())
+  private def isRowDeleted(row: InternalRow): Boolean =
+    isRowDeletedOrdinal >= 0 && row.getByte(isRowDeletedOrdinal) != RowIndexFilter.KEEP_ROW_VALUE
+
+  override def next(): Boolean = {
+    var found = false
+    while (!found && advanceToNextFile()) {
+      val row = currentFileReader.get.next()
+      if (!isRowDeleted(row)) { currentRow = projection(row); found = true }
+    }
+    found
+  }
+  override def get(): InternalRow = currentRow
   override def close(): Unit = closeCurrentFileReader()
 }
 ```
 
-- Spark calls `next()`/`get()` in pairs. `next()` moves to the next file with rows, so empty files
-  are skipped.
+- `next()` consumes rows until it finds one to return, opening the next file when the current one
+  is exhausted, so empty files are skipped. `get()` returns the row found by the last `next()`,
+  so calling `get()` twice returns the same row, as the `PartitionReader` contract requires.
+- **Deleted rows** (6.5.3) are skipped inside `next()`. Without DVs, `isRowDeletedOrdinal` is -1
+  and every row is returned.
 - Each file is read whole (`start = 0, length = size`). See the Limitations section.
 - **Cleanup:** Spark's Parquet `RecordReaderIterator` closes itself once it runs out of rows, and
   also registers a task-completion listener. `closeCurrentFileReader` is an extra safeguard for
   iterators that implement `AutoCloseable`.
-- `get()` uses the projection from 6.4.8 (d), so every row is in `readSchema` order. The returned
-  `UnsafeRow` is reused between calls, which is normal for DSv2 readers.
+- The projection from 6.4.8 (d) puts every row in `readSchema` order and drops internal DV
+  columns. The returned `UnsafeRow` is reused between calls, which is normal for DSv2 readers.
+
+### 6.5 Deletion Vector support
+
+With Deletion Vectors (DVs), a DELETE/UPDATE/MERGE doesn't rewrite Parquet files. It writes a
+bitmap of deleted row indexes and attaches its descriptor to the `AddFile`
+(`AddFile.deletionVector`). The Parquet file still contains the deleted rows, so every reader
+must drop them. The V2 scan does this by reusing V1's machinery rather than reimplementing it.
+
+**How V1 does it** (`PreprocessTableWithDVs`), for reference:
+
+1. `TahoeFileIndex` puts the DV descriptor of each file into
+   `PartitionedFile.otherConstantMetadataColumnValues`.
+2. The file format is replaced by `fileFormat.copyWithDVInfo(tablePath, optimizationsEnabled)`.
+3. An internal column `__delta_internal_is_row_deleted` (`ByteType`) is added to the data schema
+   and scan output. When `deletionVectors.useMetadataRowIndex` is on (default), the Parquet row
+   index (`_tmp_metadata_row_index`) is requested too.
+4. `DeltaParquetFileFormat` loads each file's DV bitmap and fills `is_row_deleted` per row
+   (0 = keep).
+5. A `Filter(is_row_deleted = 0)` drops deleted rows and a `Project` removes the internal column.
+
+The V2 scan performs steps 1–4 identically and does step 5 inside the partition reader.
+
+#### 6.5.1 `TahoeFileIndex.scala`: shared per-file metadata
+
+**Before**, `fileStatusWithMetadataFromAddFile` built the map inline. **After**, the same code is
+moved verbatim into a companion-object helper that both V1 and V2 call:
+
+```scala
+object TahoeFileIndex {
+  def constantMetadataForFile(
+      addFile: AddFile,
+      rowIndexFilters: Option[Map[String, RowIndexFilterType]]): Map[String, Any] = {
+    val metadata = mutable.Map.empty[String, Any]
+    addFile.baseRowId.foreach(baseRowId => metadata.put(RowId.BASE_ROW_ID, baseRowId))
+    addFile.defaultRowCommitVersion.foreach(defaultRowCommitVersion =>
+      metadata.put(DefaultRowCommitVersion.METADATA_STRUCT_FIELD_NAME, defaultRowCommitVersion))
+
+    if (addFile.deletionVector != null) {
+      metadata.put(DeltaParquetFileFormat.FILE_ROW_INDEX_FILTER_ID_ENCODED,
+        addFile.deletionVector.serializeToBase64())
+      val filterType = rowIndexFilters.getOrElse(Map.empty)
+        .getOrElse(addFile.path, RowIndexFilterType.IF_CONTAINED)
+      metadata.put(DeltaParquetFileFormat.FILE_ROW_INDEX_FILTER_TYPE, filterType)
+    }
+    metadata.toMap
+  }
+}
+
+// in abstract class TahoeFileIndex
+FileStatusWithMetadata(fs, TahoeFileIndex.constantMetadataForFile(addFile, rowIndexFilters))
+```
+
+- No behavior change for V1: same keys, same values.
+- The V2 scan passes `rowIndexFilters = None`, so files with a DV get `IF_CONTAINED` ("drop rows
+  in the bitmap"). Non-default filter types are only used by CDC reads, which stay on V1.
+- The row tracking entries (`base_row_id`, `default_row_commit_version`) are carried along too.
+  They are unused by the V2 scan today.
+
+#### 6.5.2 `DeltaPartitionReaderFactory`: DV-aware file reader
+
+`DeltaBatchScan.createReaderFactory` passes two extra arguments:
+
+```scala
+deletionVectorTablePath =
+  if (hasDeletionVectors) Some(deltaTable.deltaLog.dataPath.toString) else None,
+useMetadataRowIndex = spark.sessionState.conf.getConf(
+  DeltaSQLConf.DELETION_VECTORS_USE_METADATA_ROW_INDEX)
+```
+
+`hasDeletionVectors` (6.4.3) is true only if DVs are readable and at least one *selected* file has
+one. Otherwise the factory is exactly the one in 6.4.8, with no extra columns or per-row cost.
+
+Inside the factory:
+
+```scala
+private val hasDeletionVectors = deletionVectorTablePath.isDefined
+
+// (a) Internal columns requested from the file reader, as in PreprocessTableWithDVs
+private val deletionVectorColumns: Seq[StructField] = if (hasDeletionVectors) {
+  val rowIndexField = if (useMetadataRowIndex) {
+    Seq(StructField(ParquetFileFormat.ROW_INDEX_TEMPORARY_COLUMN_NAME, LongType, nullable = true))
+  } else Seq.empty
+  rowIndexField :+ DeltaParquetFileFormat.IS_ROW_DELETED_STRUCT_FIELD
+} else Seq.empty
+
+// (b) Reader output = readDataSchema ++ DV columns ++ partitionSchema
+private val fileRequiredSchema = StructType(readDataSchema ++ deletionVectorColumns)
+private val fileOutputSchema = StructType(fileRequiredSchema ++ partitionSchema)
+
+// (c) Where the reader finds is_row_deleted (-1 = no DV filtering)
+private val isRowDeletedOrdinal =
+  if (hasDeletionVectors) fileOutputSchema.fieldNames.indexOf(IS_ROW_DELETED_COLUMN_NAME) else -1
+
+// (d) DV-aware file format
+private val parquetFormat = {
+  val format = new DeltaParquetFileFormat(protocol, metadata)
+  deletionVectorTablePath match {
+    case Some(tablePath) => format.copyWithDVInfo(tablePath, optimizationsEnabled = useMetadataRowIndex)
+    case None => format
+  }
+}
+
+private val readerBuilder = parquetFormat.buildReaderWithPartitionValues(
+  sparkSession = spark,
+  dataSchema =                                                              // (e)
+    if (hasDeletionVectors) dataSchema.add(IS_ROW_DELETED_STRUCT_FIELD) else dataSchema,
+  partitionSchema = partitionSchema,
+  requiredSchema = fileRequiredSchema,
+  ...)
+```
+
+- **(a)** `is_row_deleted` is generated by `DeltaParquetFileFormat`, not read from the file. With
+  `useMetadataRowIndex=true`, Spark's Parquet reader fills `_tmp_metadata_row_index` with each
+  row's position in the file, and `DeltaParquetFileFormat` looks it up in the bitmap. With
+  `false`, `DeltaParquetFileFormat` counts rows itself. The row index field must be **nullable**:
+  Spark's vectorized Parquet reader rejects a non-nullable requested column that is missing from
+  the file ("Required column is missing in data file") before it gets to fill in the row index.
+- **(b)** `outputOrdinals` is computed over this wider `fileOutputSchema`, but only for
+  `readSchema` columns. So the output projection naturally drops the internal columns.
+- **(d)** `copyWithDVInfo` sets `tablePath` (used to resolve DV files stored next to the table) and
+  `optimizationsEnabled`. `DeltaParquetFileFormat` requires `optimizationsEnabled ==
+  useMetadataRowIndex` when a table path is set. With `optimizationsEnabled=false`, it also stops
+  pushing filters into Parquet, because the row counter needs to see every row. File splitting,
+  the other thing it controls, is irrelevant here since the V2 scan always reads files whole.
+- **(e)** As in V1, `is_row_deleted` is added to `dataSchema`, so the Parquet layer accepts it in
+  `requiredSchema`. It never exists in the files; Parquet returns NULL for it, and
+  `DeltaParquetFileFormat` overwrites the value.
+
+#### 6.5.3 Filtering in `DeltaBatchPartitionReader`
+
+- `PartitionedFile.otherConstantMetadataColumnValues = fileInfo.constantMetadata` hands each
+  file's DV descriptor to `DeltaParquetFileFormat` (6.4.9).
+- `next()` skips rows where `row.getByte(isRowDeletedOrdinal) != RowIndexFilter.KEEP_ROW_VALUE`.
+  This is the V1 `Filter(is_row_deleted = 0)`, applied inside the reader.
+- Files without a DV in a scan that has DVs get `is_row_deleted = 0` for every row from
+  `DeltaParquetFileFormat`, so they are read normally.
+
+#### 6.5.4 Kill switch
+
+`FallbackToV1Relations.shouldKeepAsV2ForSPJ` (6.2, check 8) sends tables with readable DVs to V1
+when `storagePartitionedJoin.deletionVectors.enabled=false`. That makes it possible to turn off
+just the DV path in production without turning off SPJ.
 
 ---
 
@@ -593,7 +781,7 @@ Take a table partitioned by `(region, state)` and a query that joins only on `re
 | :--- | :--- | :--- |
 | `DeltaKeyGroupedInputPartition.partitionKey()` | projected partition columns | `BatchScanExec`: must match the `KeyGroupedPartitioning` expressions |
 | `DeltaScanFileInfo.partitionValues` / `PartitionedFile.partitionValues` | all partition columns | `ParquetFileFormat`: must match `partitionSchema` |
-| Reader output before projection | `readDataSchema ++ partitionSchema` | produced by `buildReaderWithPartitionValues` |
+| Reader output before projection | `readDataSchema ++ [row index] ++ [is_row_deleted] ++ partitionSchema` (DV columns only when DVs are present, 6.5.2) | produced by `buildReaderWithPartitionValues` |
 | Row returned by `get()` | `readSchema` | `BatchScanExec` output attributes |
 
 ### 7.3 Column mapping
@@ -611,9 +799,11 @@ V1 output directly.
 
 ### 7.5 Deletion Vectors and CDC
 
-- With DVs, `AddFile`s point to Parquet files that still contain deleted rows, plus a bitmap. V1
-  applies the bitmap through extra columns that `TahoeFileIndex` and `DeltaParquetFileFormat`
-  add. The V2 reader doesn't do this yet, so DV-enabled tables stay on V1 (6.2, check 8).
+- DVs are applied by the same `DeltaParquetFileFormat` code and per-file metadata as V1 (6.5), so
+  results match V1. Tests compare V2 output with V1 output under every combination of
+  `useMetadataRowIndex` and the vectorized Parquet reader.
+- DVs don't change the partition layout, so they don't affect SPJ planning: DELETE/UPDATE on a
+  partition keeps the file in the same partition.
 - CDC reads need V1's CDC relation, so they stay on V1 (6.2, check 5).
 
 ---
@@ -625,7 +815,8 @@ V1 output directly.
 | Delta conf off (default) | V1 `FileSourceScanExec` | No |
 | Delta conf on, `v2.bucketing.enabled=false` | V1 | No |
 | Unpartitioned table | V1 | No |
-| Table with Deletion Vectors readable | V1 | No |
+| Partitioned table with Deletion Vectors | V2, deleted rows filtered (6.5) | **Yes** |
+| Table with Deletion Vectors, `storagePartitionedJoin.deletionVectors.enabled=false` | V1 | No |
 | CDC read (`readChangeFeed`) | V1 | No |
 | DML target (UPDATE/DELETE/MERGE) | V1 (existing `DeltaRelation` handling) | No |
 | Partitioned table, query reads no partition column | V2, `UnknownPartitioning`, one split per file | No |
@@ -643,7 +834,9 @@ V1 output directly.
   `maxPartitionBytes`). Skewed or very large partitions get less parallelism.
 - **Row-based reads only:** `columnarSupportMode = UNSUPPORTED`. The Parquet reader may decode
   vectorized internally, but rows are handed to Spark one at a time.
-- **Deletion Vectors and CDC:** always V1.
+- **CDC:** always V1.
+- **Deletion Vector reads are row-based:** deleted rows are skipped one at a time in the reader,
+  not through a vectorized filter.
 - **Identity partitioning only:** generated or expression partition columns are reported as plain
   columns. No transform expressions are reported.
 - **No runtime filtering:** the scan doesn't implement `SupportsRuntimeV2Filtering`, so dynamic
@@ -655,7 +848,7 @@ V1 output directly.
 
 ## 10. Test Suite
 
-`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 24
+`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 32
 tests.
 
 **Setup (`withSPJConf`):** turns on both SPJ confs, `pushPartValues=true`,
@@ -670,6 +863,12 @@ deterministic.
 - `assertSPJPlan(query, expectSPJ)`: when SPJ is expected, there is at least one scan, every scan
   is a `DeltaBatchScan`, and there are no join shuffles. Otherwise there is at least one join
   shuffle.
+- `checkSPJAnswerMatchesV1(query)`: runs the query with the feature off (V1) and on (V2), checks
+  the rows are equal and the V2 plan is shuffle-free.
+- `numFilesWithDVs(table)`: number of `AddFile`s with a DV. Used to make sure DML really wrote DVs
+  rather than rewriting files.
+- `insertValues(table, values)`: inserts with `REPARTITION(1)` so each partition gets one
+  multi-row file. Otherwise a single-row file is removed entirely by DELETE and no DV is written.
 
 | # | Test | What it checks |
 | :- | :--- | :--- |
@@ -694,9 +893,14 @@ deterministic.
 | 19 | E2E SPJ: Left, Right, and Full Outer Joins without shuffle exchanges | NULL-padded results. |
 | 20 | E2E SPJ: Join keys subset of partition keys (allowJoinKeysSubsetOfPartitionKeys) | Covers 7.1. |
 | 21 | SPJ with WHERE partition filter pushdown prunes non-matching partitions | One input partition per side. |
-| 22 | Deletion Vector enabled table safely falls back to V1 and filters deleted rows | Only the table without DVs uses V2. |
-| 23 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
-| 24 | SPJ with tables containing NULL partition values | NULL keys. |
+| 22–25 | SPJ filters rows deleted by Deletion Vectors (`useMetadataRowIndex` × `vectorized`) | DVs on both sides; exact rows and V1 equality for all four reader modes (6.5.2 a, d). |
+| 26 | SPJ on Deletion Vector tables after multiple DELETEs and UPDATE | Stacked DVs, UPDATE, join on partition + id, aggregation. |
+| 27 | SPJ on Deletion Vector table with DVs in some partitions and a partition filter | Mixed DV/non-DV files; partition filter selecting only DV-free / only DV partitions; data filter. |
+| 28 | SPJ on Deletion Vector enabled table without any DV | DV feature on but no DVs (`hasDeletionVectors=false`). |
+| 29 | SPJ on Deletion Vector tables with column mapping | DV + renamed column. |
+| 30 | Deletion Vector tables fall back to V1 when DV support is disabled | Kill switch (6.5.4). |
+| 31 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
+| 32 | SPJ with tables containing NULL partition values | NULL keys. |
 
 ---
 
@@ -730,4 +934,6 @@ Changes made while preparing the PR, and why:
 | Pass only data-column filters to Parquet (6.4.8 c) | Needed by the fix above. Otherwise automatic `IsNotNull(partCol)` filters drop every row. Matches V1. |
 | Require `spark.sql.sources.v2.bucketing.enabled` | Without it the V2 scan gives no benefit and only adds risk. |
 | Compute the reported partitioning once, with structured logging | `outputPartitioning()` is called more than once; Delta requires `log"..."`/`MDC` logging. |
+| Row index column is nullable (6.5.2 a) | A non-nullable `_tmp_metadata_row_index` failed with "Required column is missing in data file" in the vectorized reader. Found by the DV tests. |
+| Deletion Vector support (6.5) | Falling back to V1 meant no SPJ for any table with DVs enabled, even before any row was deleted. Reuses V1's DV code, so no new DV logic. |
 | Test cleanup and new tests 6–10, 15 | Line length and style, plus coverage for type parsing, column order, time travel, DML, and the conf guard. |

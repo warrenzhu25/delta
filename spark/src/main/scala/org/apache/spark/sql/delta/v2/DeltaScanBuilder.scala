@@ -24,6 +24,8 @@ import scala.util.Try
 import org.apache.spark.sql.delta._
 import org.apache.spark.sql.delta.actions.{AddFile, Metadata, Protocol}
 import org.apache.spark.sql.delta.catalog.DeltaTableV2
+import org.apache.spark.sql.delta.commands.DeletionVectorUtils
+import org.apache.spark.sql.delta.files.TahoeFileIndex
 import org.apache.spark.sql.delta.logging.DeltaLogKeys
 import org.apache.spark.sql.delta.metering.DeltaLogging
 import org.apache.spark.sql.delta.sources.{DeltaSourceUtils, DeltaSQLConf}
@@ -40,8 +42,9 @@ import org.apache.spark.sql.connector.expressions.{Expression => V2Expression, E
 import org.apache.spark.sql.connector.read._
 import org.apache.spark.sql.connector.read.partitioning.{KeyGroupedPartitioning, Partitioning, UnknownPartitioning}
 import org.apache.spark.sql.execution.datasources.{FileFormat, PartitionedFile}
+import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.sources.Filter
-import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.sql.types.{LongType, StructField, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.util.SerializableConfiguration
 
@@ -161,7 +164,7 @@ class DeltaBatchScan(
    * - Prunes files in the Delta Snapshot using pushed filters (partition pruning & data skipping).
    * - Groups matching AddFiles by projected partition key when SPJ is eligible.
    */
-  private lazy val plannedPartitions: Array[InputPartition] = {
+  private lazy val selectedFiles: Seq[AddFile] = {
     val attrMap = DataTypeUtils.toAttributes(tableSchema).map(a => a.name -> a).toMap
     // Filters that cannot be translated or resolved are skipped here; they are still applied
     // by Spark after the scan since all pushed filters are reported as residuals.
@@ -173,16 +176,26 @@ class DeltaBatchScan(
       }
     }.filter(_.resolved)
 
-    val addFiles: Seq[AddFile] = snapshot.filesForScan(catalystFilters).files
+    snapshot.filesForScan(catalystFilters).files
+  }
 
+  /**
+   * Whether deleted rows must be filtered. Like V1 (`PreprocessTableWithDVs`), this is only the
+   * case when Deletion Vectors are readable and at least one selected file has a DV.
+   */
+  private lazy val hasDeletionVectors: Boolean =
+    DeletionVectorUtils.deletionVectorsReadable(snapshot) &&
+      selectedFiles.exists(_.deletionVector != null)
+
+  private lazy val plannedPartitions: Array[InputPartition] = {
     if (isSPJEligible) {
       val projectedPhysicalCols = projectedPartitionFields.map(DeltaColumnMapping.getPhysicalName)
-      val grouped = addFiles.groupBy { f =>
+      val grouped = selectedFiles.groupBy { f =>
         projectedPhysicalCols.map(col => col -> f.partitionValues.getOrElse(col, null)).toMap
       }.toSeq
       planPartitions(grouped)
     } else {
-      planPartitions(addFiles.map(f => (f.partitionValues, Seq(f))))
+      planPartitions(selectedFiles.map(f => (f.partitionValues, Seq(f))))
     }
   }
 
@@ -209,7 +222,8 @@ class DeltaBatchScan(
           path = resolveFilePath(f.path),
           size = f.size,
           modificationTime = f.modificationTime,
-          partitionValues = fullFilePartitionRow
+          partitionValues = fullFilePartitionRow,
+          constantMetadata = TahoeFileIndex.constantMetadataForFile(f, rowIndexFilters = None)
         )
       }.toArray
 
@@ -257,19 +271,28 @@ class DeltaBatchScan(
       protocol = protocol,
       metadata = metadata,
       pushedFilters = pushedFilters,
-      serializableHadoopConf = hadoopConf
+      serializableHadoopConf = hadoopConf,
+      deletionVectorTablePath =
+        if (hasDeletionVectors) Some(deltaTable.deltaLog.dataPath.toString) else None,
+      useMetadataRowIndex = spark.sessionState.conf.getConf(
+        DeltaSQLConf.DELETION_VECTORS_USE_METADATA_ROW_INDEX)
     )
   }
 }
 
 /**
  * File metadata needed to construct PartitionedFile for each scan split.
+ *
+ * @param constantMetadata Per-file constant values passed to the file reader through
+ *                         `PartitionedFile.otherConstantMetadataColumnValues` (row tracking
+ *                         base values and the serialized Deletion Vector descriptor, if any).
  */
 case class DeltaScanFileInfo(
     path: String,
     size: Long,
     modificationTime: Long,
-    partitionValues: InternalRow) extends Serializable
+    partitionValues: InternalRow,
+    constantMetadata: Map[String, Any] = Map.empty) extends Serializable
 
 /**
  * InputPartition implementation for Delta Lake supporting Storage-Partitioned Join.
@@ -296,6 +319,18 @@ case class DeltaKeyGroupedInputPartition(
  * requested from the file reader, which appends the partition values taken from the Delta log
  * (`PartitionedFile.partitionValues`). The resulting `dataColumns ++ partitionColumns` row is
  * then projected into `readSchema` order.
+ *
+ * Deletion Vectors are handled like V1 (`PreprocessTableWithDVs`): when
+ * `deletionVectorTablePath` is set, the file format is switched to its DV-aware variant and two
+ * internal columns are additionally requested from the file reader: the Parquet row index
+ * (only when `useMetadataRowIndex` is enabled) and the `is_row_deleted` flag computed by
+ * [[DeltaParquetFileFormat]] from each file's DV. Deleted rows are skipped by
+ * [[DeltaBatchPartitionReader]] and the internal columns are dropped by the output projection.
+ *
+ * @param deletionVectorTablePath Table data path used to resolve DV files, or None when no
+ *                                selected file has a Deletion Vector.
+ * @param useMetadataRowIndex     Whether the row index used for DV filtering comes from the
+ *                                Parquet reader (`_metadata.row_index`) or from a row counter.
  */
 class DeltaPartitionReaderFactory(
     spark: SparkSession,
@@ -305,7 +340,9 @@ class DeltaPartitionReaderFactory(
     protocol: Protocol,
     metadata: Metadata,
     pushedFilters: Array[Filter],
-    serializableHadoopConf: SerializableConfiguration)
+    serializableHadoopConf: SerializableConfiguration,
+    deletionVectorTablePath: Option[String] = None,
+    useMetadataRowIndex: Boolean = true)
   extends PartitionReaderFactory {
 
   // scalastyle:off caselocale
@@ -315,8 +352,31 @@ class DeltaPartitionReaderFactory(
   }
   // scalastyle:on caselocale
 
-  /** Schema of the rows produced by the file reader: `readDataSchema ++ partitionSchema`. */
-  private val fileOutputSchema: StructType = StructType(readDataSchema ++ partitionSchema)
+  private val hasDeletionVectors: Boolean = deletionVectorTablePath.isDefined
+
+  /**
+   * Internal columns requested from the file reader to filter rows deleted by Deletion Vectors.
+   * Mirrors the extra scan output added by `PreprocessTableWithDVs` in V1.
+   */
+  private val deletionVectorColumns: Seq[StructField] = if (hasDeletionVectors) {
+    val rowIndexField = if (useMetadataRowIndex) {
+      // Filled by Spark's Parquet reader, which looks the column up by name. It must be nullable:
+      // the Parquet reader rejects non-nullable requested columns that are missing in the file.
+      Seq(StructField(ParquetFileFormat.ROW_INDEX_TEMPORARY_COLUMN_NAME, LongType,
+        nullable = true))
+    } else {
+      Seq.empty
+    }
+    rowIndexField :+ DeltaParquetFileFormat.IS_ROW_DELETED_STRUCT_FIELD
+  } else {
+    Seq.empty
+  }
+
+  /** Schema requested from the file reader (without partition columns). */
+  private val fileRequiredSchema: StructType = StructType(readDataSchema ++ deletionVectorColumns)
+
+  /** Schema of the rows produced by the file reader: `fileRequiredSchema ++ partitionSchema`. */
+  private val fileOutputSchema: StructType = StructType(fileRequiredSchema ++ partitionSchema)
 
   /** For each `readSchema` column, its ordinal in `fileOutputSchema`. Resolved on the driver. */
   private val outputOrdinals: Array[Int] = {
@@ -328,7 +388,21 @@ class DeltaPartitionReaderFactory(
     }
   }
 
-  private val parquetFormat = new DeltaParquetFileFormat(protocol, metadata)
+  /** Ordinal of the `is_row_deleted` column in `fileOutputSchema`, or -1 without DVs. */
+  private val isRowDeletedOrdinal: Int = if (hasDeletionVectors) {
+    fileOutputSchema.fieldNames.indexOf(DeltaParquetFileFormat.IS_ROW_DELETED_COLUMN_NAME)
+  } else {
+    -1
+  }
+
+  private val parquetFormat: DeltaParquetFileFormat = {
+    val format = new DeltaParquetFileFormat(protocol, metadata)
+    deletionVectorTablePath match {
+      case Some(tablePath) =>
+        format.copyWithDVInfo(tablePath, optimizationsEnabled = useMetadataRowIndex)
+      case None => format
+    }
+  }
 
   /**
    * Filters passed to the Parquet reader. Like V1, only filters on data columns are passed:
@@ -346,9 +420,11 @@ class DeltaPartitionReaderFactory(
 
   private val readerBuilder = parquetFormat.buildReaderWithPartitionValues(
     sparkSession = spark,
-    dataSchema = dataSchema,
+    dataSchema =
+      if (hasDeletionVectors) dataSchema.add(DeltaParquetFileFormat.IS_ROW_DELETED_STRUCT_FIELD)
+      else dataSchema,
     partitionSchema = partitionSchema,
-    requiredSchema = readDataSchema,
+    requiredSchema = fileRequiredSchema,
     filters = dataFilters,
     options = Map(FileFormat.OPTION_RETURNING_BATCH -> "false"),
     hadoopConf = serializableHadoopConf.value
@@ -361,22 +437,28 @@ class DeltaPartitionReaderFactory(
       BoundReference(i, f.dataType, f.nullable)
     }
     val projection = UnsafeProjection.create(outputExprs)
-    new DeltaBatchPartitionReader(deltaPartition, readerBuilder, projection)
+    new DeltaBatchPartitionReader(deltaPartition, readerBuilder, projection, isRowDeletedOrdinal)
   }
 }
 
 /**
  * PartitionReader that iterates through all files assigned to an InputPartition
  * and ensures underlying Parquet iterators are properly closed.
+ *
+ * @param isRowDeletedOrdinal Ordinal of the `is_row_deleted` column in the file reader rows, or
+ *                            -1 when there are no Deletion Vectors. Rows whose value is not
+ *                            [[RowIndexFilter.KEEP_ROW_VALUE]] are skipped.
  */
 class DeltaBatchPartitionReader(
     partition: DeltaKeyGroupedInputPartition,
     readerBuilder: PartitionedFile => Iterator[InternalRow],
-    projection: UnsafeProjection)
+    projection: UnsafeProjection,
+    isRowDeletedOrdinal: Int = -1)
   extends PartitionReader[InternalRow] {
 
   private val fileIterator: Iterator[DeltaScanFileInfo] = partition.files.iterator
   private var currentFileReader: Option[Iterator[InternalRow]] = None
+  private var currentRow: InternalRow = _
 
   private def closeCurrentFileReader(): Unit = {
     currentFileReader.foreach {
@@ -386,6 +468,7 @@ class DeltaBatchPartitionReader(
     currentFileReader = None
   }
 
+  /** Opens the next files until one has remaining rows. Returns false when all are consumed. */
   private def advanceToNextFile(): Boolean = {
     while (currentFileReader.forall(!_.hasNext) && fileIterator.hasNext) {
       closeCurrentFileReader()
@@ -394,24 +477,30 @@ class DeltaBatchPartitionReader(
         partitionValues = fileInfo.partitionValues,
         filePath = SparkPath.fromPathString(fileInfo.path),
         start = 0,
-        length = fileInfo.size
+        length = fileInfo.size,
+        otherConstantMetadataColumnValues = fileInfo.constantMetadata
       )
       currentFileReader = Some(readerBuilder(partitionedFile))
     }
     currentFileReader.exists(_.hasNext)
   }
 
+  private def isRowDeleted(row: InternalRow): Boolean =
+    isRowDeletedOrdinal >= 0 && row.getByte(isRowDeletedOrdinal) != RowIndexFilter.KEEP_ROW_VALUE
+
   override def next(): Boolean = {
-    if (currentFileReader.exists(_.hasNext)) {
-      true
-    } else {
-      advanceToNextFile()
+    var found = false
+    while (!found && advanceToNextFile()) {
+      val row = currentFileReader.get.next()
+      if (!isRowDeleted(row)) {
+        currentRow = projection(row)
+        found = true
+      }
     }
+    found
   }
 
-  override def get(): InternalRow = {
-    projection(currentFileReader.get.next())
-  }
+  override def get(): InternalRow = currentRow
 
   override def close(): Unit = {
     closeCurrentFileReader()
