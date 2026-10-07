@@ -1091,6 +1091,120 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
     }
   }
 
+  /** The input partitions of the only V2 scan in `df`'s executed plan. */
+  private def plannedPartitions(df: DataFrame): Seq[DeltaKeyGroupedInputPartition] = {
+    val scans = batchScans(df.queryExecution.executedPlan)
+    assert(scans.size == 1, s"Expected one V2 scan:\n${df.queryExecution.executedPlan}")
+    scans.head.scan.asInstanceOf[DeltaBatchScan].planInputPartitions().toSeq
+      .map(_.asInstanceOf[DeltaKeyGroupedInputPartition])
+  }
+
+  /** Writes `numRows` rows into `table` with many small Parquet row groups per file. */
+  private def insertWithSmallRowGroups(table: String, numRows: Int): Unit = {
+    withSQLConf("parquet.block.size" -> "4096", "parquet.page.size" -> "1024") {
+      sql(s"INSERT INTO $table SELECT /*+ REPARTITION(1) */ CAST(id AS INT), " +
+        s"md5(CAST(id AS STRING)), CONCAT('p', id % 2) FROM range($numRows)")
+    }
+  }
+
+  test("Scans without SPJ pack small files into input partitions") {
+    withTable("t_pack") {
+      sql("CREATE TABLE t_pack (id INT, v STRING, part STRING) USING delta PARTITIONED BY (part)")
+      sql("INSERT INTO t_pack SELECT /*+ REPARTITION(1) */ CAST(id AS INT), " +
+        "CAST(id AS STRING), CONCAT('p', id % 8) FROM range(800)")
+      // No partition column is read, so the scan has no partition key to report.
+      val query = "SELECT id, v FROM t_pack"
+      val expected = withSPJConf(enabled = false) { sql(query).collect().toSeq }
+      withSPJConf(enabled = true) {
+        withSQLConf(
+            SQLConf.FILES_OPEN_COST_IN_BYTES.key -> "1",
+            SQLConf.FILES_MIN_PARTITION_NUM.key -> "1") {
+          val packed = sql(query)
+          checkAnswer(packed, expected)
+          // All 8 small files fit into one input partition.
+          assert(plannedPartitions(packed).map(_.files.length) == Seq(8))
+        }
+        withSQLConf(
+            DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_FILE_SPLITTING_ENABLED.key -> "false") {
+          val unpacked = sql(query)
+          checkAnswer(unpacked, expected)
+          assert(plannedPartitions(unpacked).map(_.files.length) == Seq.fill(8)(1))
+        }
+      }
+    }
+  }
+
+  test("Scans without SPJ split large files") {
+    withTable("t_split") {
+      sql("CREATE TABLE t_split (id INT, v STRING, part STRING) USING delta " +
+        "PARTITIONED BY (part)")
+      insertWithSmallRowGroups("t_split", numRows = 20000)
+      val queries = Seq(
+        "SELECT id, v FROM t_split",
+        "SELECT count(*), sum(id) FROM t_split",
+        // The block fields describe the byte range a row was read from: same ranges as V1.
+        "SELECT id, _metadata.file_name, _metadata.file_block_start, " +
+          "_metadata.file_block_length FROM t_split")
+      for (query <- queries) {
+        withSQLConf(
+            SQLConf.FILES_MAX_PARTITION_BYTES.key -> "65536",
+            SQLConf.FILES_MIN_PARTITION_NUM.key -> "1") {
+          val expected = withSPJConf(enabled = false) { sql(query).collect().toSeq }
+          withSPJConf(enabled = true) {
+            val df = sql(query)
+            checkAnswer(df, expected)
+            val splits = plannedPartitions(df).flatMap(_.files)
+            // Each of the 2 files is read in several byte ranges that cover it exactly once.
+            assert(splits.size > 2, s"Expected the files to be split: $splits")
+            splits.groupBy(_.path).values.foreach { ranges =>
+              val sorted = ranges.sortBy(_.start)
+              assert(sorted.head.start == 0)
+              sorted.sliding(2).filter(_.size == 2).foreach { case Seq(a, b) =>
+                assert(a.start + a.length == b.start)
+              }
+              assert(sorted.last.start + sorted.last.length == sorted.head.size)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  for (useMetadataRowIndex <- Seq(true, false)) {
+    test("Scans without SPJ split Deletion Vector files only with the metadata row index - " +
+        s"useMetadataRowIndex=$useMetadataRowIndex") {
+      withTable("t_split_dv") {
+        sql("CREATE TABLE t_split_dv (id INT, v STRING, part STRING) USING delta " +
+          "PARTITIONED BY (part) TBLPROPERTIES ('delta.enableDeletionVectors' = 'true')")
+        insertWithSmallRowGroups("t_split_dv", numRows = 20000)
+        sql("DELETE FROM t_split_dv WHERE id % 7 = 0")
+        assert(numFilesWithDVs("t_split_dv") == 2)
+        withSQLConf(DeltaSQLConf.DELETION_VECTORS_USE_METADATA_ROW_INDEX.key ->
+            useMetadataRowIndex.toString) {
+          for (query <- Seq("SELECT id, v FROM t_split_dv",
+              "SELECT id, _metadata.row_index FROM t_split_dv")) {
+            val expected = withSPJConf(enabled = false) { sql(query).collect().toSeq }
+            withSPJConf(enabled = true) {
+              withSQLConf(
+                  SQLConf.FILES_MAX_PARTITION_BYTES.key -> "65536",
+                  SQLConf.FILES_MIN_PARTITION_NUM.key -> "1") {
+                val df = sql(query)
+                checkAnswer(df, expected)
+                val numSplits = plannedPartitions(df).map(_.files.length).sum
+                if (useMetadataRowIndex) {
+                  assert(numSplits > 2)
+                } else {
+                  // Row indexes are counted by the reader, so files must be read whole (like V1).
+                  assert(numSplits == 2)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   test("SPJ with Delta Column Mapping (name mode)") {
     withTable("t_cm1", "t_cm2") {
       sql("CREATE TABLE t_cm1 (id INT, part STRING) USING delta PARTITIONED BY (part) " +

@@ -279,6 +279,16 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .booleanConf
       .createWithDefault(true)
 
+  val DELTA_STORAGE_PARTITIONED_JOIN_FILE_SPLITTING_ENABLED =
+    buildConf("storagePartitionedJoin.fileSplitting.enabled")
+      .internal()
+      .doc("When true, the Storage-Partitioned Join V2 scan splits large files and packs small " +
+        "files into input partitions like the V1 file scan (spark.sql.files.maxPartitionBytes, " +
+        "spark.sql.files.openCostInBytes). When false, every file is read whole, in its own " +
+        "input partition, or in its partition key's input partition for SPJ.")
+      .booleanConf
+      .createWithDefault(true)
+
   val DELTA_COMMIT_VALIDATION_ENABLED =
     buildConf("commitValidation.enabled")
       .internal()

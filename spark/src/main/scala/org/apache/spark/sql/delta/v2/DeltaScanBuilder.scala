@@ -42,7 +42,7 @@ import org.apache.spark.sql.connector.expressions.{Expression => V2Expression, E
 import org.apache.spark.sql.connector.expressions.filter.{Predicate => V2Predicate}
 import org.apache.spark.sql.connector.read._
 import org.apache.spark.sql.connector.read.partitioning.{KeyGroupedPartitioning, Partitioning, UnknownPartitioning}
-import org.apache.spark.sql.execution.datasources.{FileFormat, PartitionedFile}
+import org.apache.spark.sql.execution.datasources.{FileFormat, FilePartition, PartitionedFile}
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.internal.connector.PredicateUtils
 import org.apache.spark.sql.sources.Filter
@@ -201,7 +201,11 @@ class DeltaBatchScan(
   @volatile private var runtimeFilteredFiles: Option[Seq[AddFile]] = None
   @volatile private var runtimeFilteredPartitions: Option[Array[InputPartition]] = None
 
-  /** Groups `files` by projected partition key when SPJ is eligible, one split per file else. */
+  /**
+   * Groups `files` by projected partition key when SPJ is eligible. Otherwise files are split and
+   * packed into input partitions like the V1 file scan (see [[packFiles]]), or, with file
+   * splitting disabled, read whole in one input partition each.
+   */
   private def planPartitionsFor(files: Seq[AddFile]): Array[InputPartition] = {
     if (isSPJEligible) {
       val projectedPhysicalCols = projectedPartitionFields.map(DeltaColumnMapping.getPhysicalName)
@@ -209,9 +213,74 @@ class DeltaBatchScan(
         projectedPhysicalCols.map(col => col -> f.partitionValues.getOrElse(col, null)).toMap
       }.toSeq
       planPartitions(grouped)
+    } else if (fileSplittingEnabled) {
+      packFiles(files)
     } else {
       planPartitions(files.map(f => (f.partitionValues, Seq(f))))
     }
+  }
+
+  private def fileSplittingEnabled: Boolean = spark.sessionState.conf.getConf(
+    DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_FILE_SPLITTING_ENABLED)
+
+  private def useMetadataRowIndex: Boolean =
+    spark.sessionState.conf.getConf(DeltaSQLConf.DELETION_VECTORS_USE_METADATA_ROW_INDEX)
+
+  /**
+   * Whether files can be read in byte ranges. Same as `DeltaParquetFileFormat.isSplitable` for
+   * the file format the reader factory builds: only DV reads that count row indexes themselves
+   * (`useMetadataRowIndex = false`) must read whole files.
+   */
+  private lazy val isSplittable: Boolean = !(hasDeletionVectors && !useMetadataRowIndex)
+
+  /**
+   * Target split size, computed like V1 (`FileSourceScanExec`) from all selected files:
+   * `spark.sql.files.maxPartitionBytes`, lowered so that small scans still use the default
+   * parallelism, but not below `spark.sql.files.openCostInBytes`.
+   */
+  private lazy val maxSplitBytes: Long = {
+    val openCostInBytes = spark.sessionState.conf.filesOpenCostInBytes
+    FilePartition.maxSplitBytes(spark, selectedFiles.map(_.size + openCostInBytes).sum)
+  }
+
+  /** Splits `f` into `maxSplitBytes` byte ranges if files are splittable, else one whole range. */
+  private def splitFile(f: AddFile): Seq[DeltaScanFileInfo] = {
+    val ranges = if (isSplittable) {
+      (0L until f.size by maxSplitBytes).map { start =>
+        start -> math.min(maxSplitBytes, f.size - start)
+      }
+    } else {
+      Seq(0L -> f.size)
+    }
+    val partitionValues = extractPartitionRow(f.partitionValues, metadata.partitionSchema)
+    val constantMetadata = TahoeFileIndex.constantMetadataForFile(f, rowIndexFilters = None)
+    ranges.map { case (start, length) =>
+      toFileInfo(f, partitionValues, constantMetadata, start, length)
+    }
+  }
+
+  /**
+   * Plans the input partitions of a scan without SPJ like the V1 file scan: files are split into
+   * byte ranges, sorted by size (largest first) and packed into input partitions of up to
+   * `maxSplitBytes` with Spark's own `FilePartition.getFilePartitions` (next-fit decreasing,
+   * counting `spark.sql.files.openCostInBytes` per file, and honoring
+   * `spark.sql.files.maxPartitionNum`). Such scans report no partition key.
+   */
+  private def packFiles(files: Seq[AddFile]): Array[InputPartition] = {
+    val splits = files.flatMap(splitFile).sortBy(_.length)(Ordering[Long].reverse)
+    val infoBySplit = new java.util.IdentityHashMap[PartitionedFile, DeltaScanFileInfo]()
+    val partitionedFiles = splits.map { info =>
+      val partitionedFile = info.toPartitionedFile
+      infoBySplit.put(partitionedFile, info)
+      partitionedFile
+    }
+    FilePartition.getFilePartitions(spark, partitionedFiles, maxSplitBytes).map { p =>
+      DeltaKeyGroupedInputPartition(
+        partitionId = p.index,
+        files = p.files.map(infoBySplit.get),
+        partitionKeyInternalRow = new GenericInternalRow(0)
+      ): InputPartition
+    }.toArray
   }
 
   /**
@@ -245,19 +314,33 @@ class DeltaBatchScan(
     new GenericInternalRow(partitionRowValues)
   }
 
+  /** The byte range `[start, start + length)` of `f` to read. */
+  private def toFileInfo(
+      f: AddFile,
+      partitionValues: InternalRow,
+      constantMetadata: Map[String, Any],
+      start: Long,
+      length: Long): DeltaScanFileInfo =
+    DeltaScanFileInfo(
+      path = resolveFilePath(f.path),
+      start = start,
+      length = length,
+      size = f.size,
+      modificationTime = f.modificationTime,
+      partitionValues = partitionValues,
+      constantMetadata = constantMetadata)
+
   private def planPartitions(
       groups: Seq[(Map[String, String], Seq[AddFile])]): Array[InputPartition] = {
     groups.zipWithIndex.map { case (_, files) -> idx =>
       val groupingKeyRow = extractPartitionRow(files.head.partitionValues, projectedPartitionFields)
       val fileInfos = files.map { f =>
-        val fullFilePartitionRow = extractPartitionRow(f.partitionValues, metadata.partitionSchema)
-        DeltaScanFileInfo(
-          path = resolveFilePath(f.path),
-          size = f.size,
-          modificationTime = f.modificationTime,
-          partitionValues = fullFilePartitionRow,
-          constantMetadata = TahoeFileIndex.constantMetadataForFile(f, rowIndexFilters = None)
-        )
+        toFileInfo(
+          f,
+          partitionValues = extractPartitionRow(f.partitionValues, metadata.partitionSchema),
+          constantMetadata = TahoeFileIndex.constantMetadataForFile(f, rowIndexFilters = None),
+          start = 0L,
+          length = f.size)
       }.toArray
 
       DeltaKeyGroupedInputPartition(
@@ -354,8 +437,7 @@ class DeltaBatchScan(
       serializableHadoopConf = hadoopConf,
       deletionVectorTablePath =
         if (hasDeletionVectors) Some(deltaTable.deltaLog.dataPath.toString) else None,
-      useMetadataRowIndex = spark.sessionState.conf.getConf(
-        DeltaSQLConf.DELETION_VECTORS_USE_METADATA_ROW_INDEX)
+      useMetadataRowIndex = useMetadataRowIndex
     )
   }
 }
@@ -363,16 +445,34 @@ class DeltaBatchScan(
 /**
  * File metadata needed to construct PartitionedFile for each scan split.
  *
+ * @param start            Offset of the first byte of the file to read.
+ * @param length           Number of bytes of the file to read, starting at `start`. A file is
+ *                         read in several byte ranges when it is split (see
+ *                         `DeltaBatchScan.packFiles`); the Parquet reader then reads the row
+ *                         groups whose midpoint falls into the range.
+ * @param size             Size of the whole file.
  * @param constantMetadata Per-file constant values passed to the file reader through
  *                         `PartitionedFile.otherConstantMetadataColumnValues` (row tracking
  *                         base values and the serialized Deletion Vector descriptor, if any).
  */
 case class DeltaScanFileInfo(
     path: String,
+    start: Long,
+    length: Long,
     size: Long,
     modificationTime: Long,
     partitionValues: InternalRow,
-    constantMetadata: Map[String, Any] = Map.empty) extends Serializable
+    constantMetadata: Map[String, Any] = Map.empty) extends Serializable {
+
+  def toPartitionedFile: PartitionedFile = PartitionedFile(
+    partitionValues = partitionValues,
+    filePath = SparkPath.fromPathString(path),
+    start = start,
+    length = length,
+    modificationTime = modificationTime,
+    fileSize = size,
+    otherConstantMetadataColumnValues = constantMetadata)
+}
 
 /**
  * InputPartition implementation for Delta Lake supporting Storage-Partitioned Join.
@@ -706,15 +806,7 @@ class DeltaBatchPartitionReader(
     while (currentFileReader.forall(!_.hasNext) && fileIterator.hasNext) {
       closeCurrentFileReader()
       val fileInfo = fileIterator.next()
-      val partitionedFile = PartitionedFile(
-        partitionValues = fileInfo.partitionValues,
-        filePath = SparkPath.fromPathString(fileInfo.path),
-        start = 0,
-        length = fileInfo.size,
-        modificationTime = fileInfo.modificationTime,
-        fileSize = fileInfo.size,
-        otherConstantMetadataColumnValues = fileInfo.constantMetadata
-      )
+      val partitionedFile = fileInfo.toPartitionedFile
       constantMetadataRow =
         constantMetadata.map(_.rowFor(partitionedFile)).getOrElse(InternalRow.empty)
       currentFileReader = Some(readerBuilder(partitionedFile))
