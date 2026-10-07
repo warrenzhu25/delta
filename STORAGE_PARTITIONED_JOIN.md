@@ -23,6 +23,7 @@ can understand the change without reading the diff side by side.
    - [6.4 `v2/DeltaScanBuilder.scala`: the V2 scan](#64-v2deltascanbuilderscala-the-v2-scan)
    - [6.5 Deletion Vector support](#65-deletion-vector-support)
    - [6.6 `_metadata` column support](#66-_metadata-column-support)
+   - [6.7 Dynamic partition pruning](#67-dynamic-partition-pruning)
 7. [Design Details & Invariants](#7-design-details--invariants)
 8. [Behavior Matrix](#8-behavior-matrix)
 9. [Limitations](#9-limitations)
@@ -54,7 +55,8 @@ This change adds an **opt-in** DataSource V2 read path for partitioned Delta tab
 SPJ. Tables with **Deletion Vectors** are supported: the V2 reader filters deleted rows the same
 way the V1 reader does (6.5). The **`_metadata` column** (file metadata, `row_index`, and the row
 tracking fields `row_id` / `row_commit_version`) is supported too, with the same values as V1
-(6.6).
+(6.6). **Dynamic partition pruning** prunes the V2 scan at runtime, both in broadcast joins and in
+shuffle-free SPJ joins (6.7).
 
 ---
 
@@ -104,8 +106,8 @@ have to sort its partitions.
 | `spark/src/main/scala/org/apache/spark/sql/delta/catalog/DeltaTableV2.scala` | `with SupportsRead`, `newScanBuilder`; `with SupportsMetadataColumns`, `metadataColumns` (6.6.1) | +30 / -2 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/DeltaAnalysis.scala` | V2 → V1 conversion keeps `_metadata` references valid (6.6.5) | +93 / -7 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/files/TahoeFileIndex.scala` | Per-file constant metadata (row tracking, DV descriptor) moved into a reusable `TahoeFileIndex.constantMetadataForFile` | +30 / -17 |
-| `spark/src/main/scala/org/apache/spark/sql/delta/v2/DeltaScanBuilder.scala` | **New.** Scan builder, scan (with statistics), input partition, reader factory (with `_metadata`), reader (with DV filtering) | ~690 |
-| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 47 tests | ~980 |
+| `spark/src/main/scala/org/apache/spark/sql/delta/v2/DeltaScanBuilder.scala` | **New.** Scan builder, scan (with statistics and runtime filtering), input partition, reader factory (with `_metadata`), reader (with DV filtering) | ~745 |
+| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 53 tests | ~1130 |
 
 No other code paths change when the conf is `false`. The only extra work is two conf lookups per
 Delta relation during analysis (plus two more when Spark asks a Delta table for its metadata
@@ -137,11 +139,15 @@ sequenceDiagram
         Planner->>Builder: build()
         Builder-->>Scan: DeltaBatchScan(readSchema, pushedFilters)
         Planner->>Scan: outputPartitioning()
-        Scan->>Scan: plannedPartitions: filesForScan + group AddFiles by key
+        Scan->>Scan: originalPartitions: filesForScan + group AddFiles by key
         Scan-->>Planner: KeyGroupedPartitioning([identity(region)], n)
+        Planner->>Planner: Both sides key-grouped on region:<br/>no ShuffleExchangeExec
+        opt Dynamic partition pruning (6.7)
+            Planner->>Scan: filter(region IN (values from the other side))
+            Scan->>Scan: drop files, regroup the rest
+        end
         Planner->>Scan: planInputPartitions()
         Scan-->>Planner: DeltaKeyGroupedInputPartition[] (HasPartitionKey)
-        Planner->>Planner: Both sides key-grouped on region:<br/>no ShuffleExchangeExec
         Planner->>Scan: createReaderFactory()
         Scan-->>Exec: DeltaPartitionReaderFactory (driver builds Parquet reader fn)
         Exec->>Exec: per task: read each file in the group,<br/>skip rows deleted by DVs,<br/>add partition values and _metadata, project to readSchema
@@ -363,7 +369,7 @@ class DeltaBatchScan(val spark, val deltaTable, val tableSchema, val readSchema,
 - **`isSPJEligible`** is false when the query reads no partition column, for example
   `SELECT count(*)` or `SELECT data_col`. The scan then reports `UnknownPartitioning`.
 
-#### 6.4.3 `DeltaBatchScan.plannedPartitions`: pruning and grouping
+#### 6.4.3 `DeltaBatchScan.originalPartitions`: pruning and grouping
 
 ```scala
 private lazy val selectedFiles: Seq[AddFile] = {
@@ -384,16 +390,18 @@ private lazy val hasDeletionVectors: Boolean =
   DeletionVectorUtils.deletionVectorsReadable(snapshot) &&
     selectedFiles.exists(_.deletionVector != null)
 
-private lazy val plannedPartitions: Array[InputPartition] = {
+private lazy val originalPartitions: Array[InputPartition] = planPartitionsFor(selectedFiles)
+
+private def planPartitionsFor(files: Seq[AddFile]): Array[InputPartition] = {
   // (c) Group files by partition key
   if (isSPJEligible) {
     val projectedPhysicalCols = projectedPartitionFields.map(DeltaColumnMapping.getPhysicalName)
-    val grouped = selectedFiles.groupBy { f =>
+    val grouped = files.groupBy { f =>
       projectedPhysicalCols.map(col => col -> f.partitionValues.getOrElse(col, null)).toMap
     }.toSeq
     planPartitions(grouped)
   } else {
-    planPartitions(selectedFiles.map(f => (f.partitionValues, Seq(f))))   // one split per file
+    planPartitions(files.map(f => (f.partitionValues, Seq(f))))   // one split per file
   }
 }
 ```
@@ -410,11 +418,12 @@ private lazy val plannedPartitions: Array[InputPartition] = {
   *projected* partition columns only. Files from different full partitions (`US/CA`, `US/NY`)
   share a group when only `region` is projected. The `else` branch makes one split per file when
   SPJ doesn't apply.
-- `selectedFiles` and `plannedPartitions` are `lazy val`s, so the Delta log is scanned once per
+- `selectedFiles` and `originalPartitions` are `lazy val`s, so the Delta log is scanned once per
   scan, even though Spark calls `estimateStatistics()`, `outputPartitioning()`,
   `planInputPartitions()` and `createReaderFactory()`.
 - `selectedFiles` is separate from the grouping so that statistics (6.4.6a) and
-  `hasDeletionVectors` (6.5) use the same pruned file list.
+  `hasDeletionVectors` (6.5) use the same pruned file list. Runtime filtering (6.7) regroups a
+  subset of these files with the same `planPartitionsFor`, and doesn't change either.
 
 #### 6.4.4 Turning partition strings into typed rows
 
@@ -468,23 +477,25 @@ private def planPartitions(groups: Seq[(Map[String, String], Seq[AddFile])]): Ar
 #### 6.4.6 Reporting partitioning
 
 ```scala
-override def planInputPartitions(): Array[InputPartition] = plannedPartitions
+override def planInputPartitions(): Array[InputPartition] =
+  runtimeFilteredPartitions.getOrElse(originalPartitions)   // runtime filtering: 6.7
 override def outputPartitioning(): Partitioning = reportedPartitioning
 
 private lazy val reportedPartitioning: Partitioning =
   if (isSPJEligible) {
     logInfo(log"Reporting KeyGroupedPartitioning with " +
-      log"${MDC(DeltaLogKeys.NUM_PARTITIONS, plannedPartitions.length)} partitions for " +
+      log"${MDC(DeltaLogKeys.NUM_PARTITIONS, originalPartitions.length)} partitions for " +
       log"table ${MDC(DeltaLogKeys.TABLE_NAME, deltaTable.name())}")
-    new KeyGroupedPartitioning(groupingKeyTransforms, plannedPartitions.length)
+    new KeyGroupedPartitioning(groupingKeyTransforms, originalPartitions.length)
   } else {
-    new UnknownPartitioning(plannedPartitions.length)
+    new UnknownPartitioning(originalPartitions.length)
   }
 ```
 
 - Computed once and logged once, using Delta's structured logging (`log"..."` with `MDC`).
-- `numPartitions` must equal the length of `planInputPartitions()`. Both come from the same
-  `plannedPartitions`.
+- `numPartitions` must equal the length of `planInputPartitions()` at planning time. Both come
+  from `originalPartitions`. After dynamic partition pruning, `planInputPartitions()` can return
+  fewer partitions; Spark expects that and doesn't re-check the reported number (6.7).
 
 #### 6.4.6a Reporting statistics
 
@@ -1113,6 +1124,119 @@ private def v1MetadataAttributeFor(v2Relation, lr): Option[(ExprId, AttributeRef
 - With the feature off, V2 relations expose no metadata column (6.6.1), so the map is empty and
   the conversion is the same as before.
 
+### 6.7 Dynamic partition pruning
+
+Take a star-schema query such as
+
+```sql
+SELECT ... FROM sales s JOIN stores d ON s.store_part = d.store_part WHERE d.region = 'US'
+```
+
+where `sales` is partitioned by `store_part`. Which `store_part` values survive is only known once
+the `stores` side runs. Spark's **dynamic partition pruning (DPP)** runs that side first (or reuses
+its broadcast), collects the join keys, and hands them to the fact scan as a runtime filter. The
+V1 scan supports this through `FileSourceScanExec`'s partition filters. Before this change, the V2
+scan did not implement `SupportsRuntimeV2Filtering`, so turning the feature on made star joins
+read every partition of the fact table.
+
+#### 6.7.1 How Spark drives it
+
+1. **Planning (`PartitionPruning` rule).** For a `DataSourceV2ScanRelation` whose scan implements
+   `SupportsRuntimeV2Filtering`, Spark checks whether the join key on this side is one of
+   `scan.filterAttributes()`. If so, and the filter is worth it (see 6.7.4), it adds a
+   `DynamicPruningExpression(key IN (subquery))` to the `BatchScanExec`'s `runtimeFilters`.
+2. **Execution (`BatchScanExec.filteredPartitions`).** Once the subquery has run, Spark turns the
+   filter into a V2 predicate, `IN(FieldReference(key), LiteralValue(v1), ...)`, calls
+   `scan.filter(predicates)` and then `scan.toBatch.planInputPartitions()` **again**.
+3. **Key-grouped scans.** When the scan reported `KeyGroupedPartitioning`, Spark requires every new
+   partition to be `HasPartitionKey` and the new keys to be a subset of the original keys. It then
+   pads the missing keys with empty partitions, so the join stays shuffle-free and lines up with
+   the other side exactly as planned.
+
+#### 6.7.2 `filterAttributes`
+
+```scala
+override def filterAttributes(): Array[NamedReference] =
+  projectedPartitionColumns.map(c => FieldReference.column(c): NamedReference).toArray
+```
+
+- Only partition columns in `readSchema` (logical names). Spark only plans DPP on a column the
+  scan lists here, and only partition columns can be pruned by looking at
+  `AddFile.partitionValues`. Pruning by data columns would need file statistics; not supported,
+  same as V1.
+- A partition column that the query doesn't read isn't in the scan output, so Spark can't reference
+  it anyway.
+
+#### 6.7.3 `filter`
+
+```scala
+@volatile private var runtimeFilteredFiles: Option[Seq[AddFile]] = None
+@volatile private var runtimeFilteredPartitions: Option[Array[InputPartition]] = None
+
+override def filter(predicates: Array[V2Predicate]): Unit = {
+  val partitionAttrs = DataTypeUtils.toAttributes(metadata.partitionSchema)
+  val resolver = spark.sessionState.conf.resolver
+  val partitionFilters: Seq[Expression] = predicates.toSeq
+    .flatMap(PredicateUtils.toV1)                                            // (a)
+    .flatMap(f => Try(DeltaSourceUtils.translateFilters(Array(f))).toOption)
+    .map(_.transform {
+      case u: UnresolvedAttribute =>
+        partitionAttrs.find(a => resolver(a.name, u.name)).getOrElse(u)     // (b)
+    })
+    .filter(_.resolved)
+  if (partitionFilters.nonEmpty) {
+    val keep = Predicate.createInterpreted(
+      BindReferences.bindReference(partitionFilters.reduce(And), partitionAttrs))
+    val files = runtimeFilteredFiles.getOrElse(selectedFiles)                // (c)
+    val remainingFiles = files.filter { f =>
+      keep.eval(extractPartitionRow(f.partitionValues, metadata.partitionSchema))   // (d)
+    }
+    logInfo(...)   // "Runtime filtering kept N of M files for table T"
+    runtimeFilteredFiles = Some(remainingFiles)
+    runtimeFilteredPartitions = Some(planPartitionsFor(remainingFiles))      // (e)
+  }
+}
+```
+
+- **(a) Translation.** `PredicateUtils.toV1` (Spark's own V2 → V1 converter) turns the `IN`
+  predicate into a `sources.In`, and `DeltaSourceUtils.translateFilters` turns that into a Catalyst
+  expression, the same path as pushed filters (6.4.3 a). Predicates that can't be translated are
+  dropped. That is safe: runtime filters only skip files; the join still filters the rows.
+- **(b) Resolution.** Attributes are resolved against the **partition schema only**, with the
+  session resolver (case-insensitive by default). Anything that references another column stays
+  unresolved and is dropped.
+- **(c) Repeated calls.** Filters are applied on top of earlier runtime filters, so several DPP
+  filters on one scan (for example from two dimension tables) combine with AND.
+- **(d) Evaluation.** Each file's partition values are parsed with `extractPartitionRow` (6.4.4),
+  the same typed parsing V1 uses, so Date / Timestamp / numeric keys and column mapping (physical
+  names) behave the same as in V1. The key Spark sends is already of the column's type.
+- **(e) Regrouping.** The remaining files are grouped with the same `planPartitionsFor` as
+  `originalPartitions` (6.4.3). Since the files are a subset, the keys are a subset of the
+  original keys, which is what Spark requires (6.7.1, step 3). For `UnknownPartitioning` scans
+  this is simply one split per remaining file.
+- **What does not change:** `reportedPartitioning` (the plan is already fixed),
+  `estimateStatistics()` (planning is over) and `hasDeletionVectors` (computed from all selected
+  files, so the reader is still set up for DVs if any remaining file has one; a scan with no DV
+  files left just carries an unused DV column).
+- **Thread safety:** `filter` and `planInputPartitions` are called from the driver, but possibly
+  from different threads during AQE; the two fields are `@volatile` and each is written once per
+  `filter` call.
+
+#### 6.7.4 When Spark plans DPP
+
+These are Spark's rules, not Delta's, but they decide whether the code above runs:
+
+| Mode | Settings | Behavior |
+| :--- | :--- | :--- |
+| Broadcast join (default) | `dynamicPartitionPruning.enabled=true` (default), `reuseBroadcastOnly=true` (default) | DPP reuses the dimension side's broadcast, so the filter costs nothing extra. |
+| Shuffle-free SPJ join | `reuseBroadcastOnly=false` | No broadcast to reuse, so Spark runs the dimension side as a separate subquery. It only does so when its cost estimate says it is worth it (the filtered side must be much larger than the other side, scaled by `dynamicPartitionPruning.fallbackFilterRatio`). |
+
+- With SPJ and the default `reuseBroadcastOnly=true`, the join has no broadcast, so **no DPP** is
+  planned; the scan just reads all partitions as before. This is also V1's behavior for
+  non-broadcast joins.
+- The filtered scan's size comes from `estimateStatistics()` (6.4.6a), which is what makes the
+  cost check work.
+
 ---
 
 ## 7. Design Details & Invariants
@@ -1178,6 +1302,7 @@ row tracking formula as V1 (6.6), and every `_metadata` test compares V2 output 
 | Partitioned table, query reads no partition column | V2, `UnknownPartitioning`, one split per file | No |
 | Partitioned table, both join sides key-grouped on compatible keys | V2, `KeyGroupedPartitioning` | **Yes** |
 | One side V2 key-grouped, other side V1 or incompatible | V2 + V1 | No (Spark shuffles) |
+| Join on a partition column with a selective other side (DPP) | V2, pruned at runtime to the matching partitions (6.7) | Unchanged (Yes if the join is SPJ) |
 
 ---
 
@@ -1195,8 +1320,9 @@ row tracking formula as V1 (6.6), and every `_metadata` test compares V2 output 
   not through a vectorized filter.
 - **Identity partitioning only:** generated or expression partition columns are reported as plain
   columns. No transform expressions are reported.
-- **No runtime filtering:** the scan doesn't implement `SupportsRuntimeV2Filtering`, so dynamic
-  partition pruning doesn't prune this scan.
+- **Runtime filtering on partition columns only:** dynamic partition pruning prunes by partition
+  values (6.7), as in V1. Data columns are not offered as runtime filter columns, so file
+  statistics are not used to skip files at runtime.
 - **No V1 file-scan metrics:** metrics such as "number of files read" don't show up the way they
   do for `FileSourceScanExec`.
 
@@ -1204,7 +1330,7 @@ row tracking formula as V1 (6.6), and every `_metadata` test compares V2 output 
 
 ## 10. Test Suite
 
-`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 47
+`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 53
 tests.
 
 **Setup (`withSPJConf`):** turns on both SPJ confs, `pushPartValues=true`,
@@ -1265,12 +1391,26 @@ deterministic.
 | 42 | `_metadata` on an unpartitioned table with SPJ enabled still uses V1 | No metadata column exposed for tables that fall back (6.6.1 a). |
 | 43 | Change data feed reads work with SPJ enabled | `readChangeFeed` option and `table_changes` still use V1. |
 | 44–45 | DML filtering on _metadata behaves the same with SPJ enabled as with V1 (DVs off / on) | UPDATE / DELETE / MERGE with a `_metadata` condition give the same outcome (error condition) as V1 (6.6.5). |
-| 46 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
-| 47 | SPJ with tables containing NULL partition values | NULL keys. |
+| 46 | Dynamic partition pruning prunes the V2 scan in a broadcast join | Star join with broadcast; the fact scan has a DPP filter and reads 2 of 4 files (6.7). |
+| 47 | Dynamic partition pruning in a shuffle-free SPJ join | No broadcast, `reuseBroadcastOnly=false`; the fact scan reads 2 of 4 files and the join stays shuffle-free (6.7.1, step 3). |
+| 48 | Dynamic partition pruning that removes every partition | The surviving dimension key is not in the fact table: 0 files read, with and without broadcast. |
+| 49 | Dynamic partition pruning on a table with Deletion Vectors | DVs in two fact partitions; pruned scan still filters deleted rows. |
+| 50 | Dynamic partition pruning with a typed partition column and column mapping | DATE partition key, column mapping `name` (physical names in `partitionValues`, 6.7.3 d). |
+| 51 | No dynamic partition pruning on data columns or when DPP is disabled | No DPP filter when joining on a data column; all files read with DPP off. |
+| 52 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
+| 53 | SPJ with tables containing NULL partition values | NULL keys. |
 
 The `_metadata` tests use `checkMatchesV1(query, expectV2)`: it runs the query with the feature
 off and on, checks the rows are equal, and checks whether the plan with the feature on has a V2
 scan.
+
+The DPP tests use a star schema (`createStarSchema`): a 4000-row fact table with one file in each
+of 4 partitions, and a small dimension table that maps 2 of the partitions to the selected region.
+The fact table is large so that Spark's cost check (6.7.4) plans DPP even without a broadcast.
+`checkDPP(query, broadcast, expectedFiles)` (under `withDPPConf`, which turns on DPP and sets
+`reuseBroadcastOnly` to `broadcast`) compares the rows with V1, finds the V2 scans with a
+`DynamicPruningExpression`, and counts the files in `planInputPartitions()` after execution,
+which reflects the runtime filter.
 
 ---
 
@@ -1282,10 +1422,15 @@ spark.conf.set("spark.sql.sources.v2.bucketing.enabled", "true")
 spark.conf.set("spark.sql.sources.v2.bucketing.pushPartValues.enabled", "true")
 // Optional: allow SPJ when joining on a subset of the table's partition columns
 spark.conf.set("spark.sql.sources.v2.bucketing.allowJoinKeysSubsetOfPartitionKeys.enabled", "true")
+// Optional: allow dynamic partition pruning in shuffle-free SPJ joins, which have no broadcast to
+// reuse (6.7.4). Broadcast joins get DPP with the defaults.
+spark.conf.set("spark.sql.optimizer.dynamicPartitionPruning.reuseBroadcastOnly", "false")
 ```
 
 Check the plan: `EXPLAIN` should show `BatchScan ... DeltaBatchScan[...]` under the join, with no
-`Exchange hashpartitioning` above it.
+`Exchange hashpartitioning` above it. With DPP, the fact table's `BatchScan` also shows
+`RuntimeFilters: [dynamicpruningexpression(...)]`, and the driver log says
+"Runtime filtering kept N of M files".
 
 ```bash
 build/sbt "spark/testOnly org.apache.spark.sql.delta.DeltaStoragePartitionedJoinSuite"
@@ -1311,4 +1456,5 @@ Changes made while preparing the PR, and why:
 | Metadata column only exposed on tables that stay V2 (6.6.1 a) | Spark resolves `_metadata` on the V2 relation before the V1 fallback; exposing it on every table would break `_metadata` on relations that fall back. Test 42. |
 | `_metadata` references remapped in DELETE / UPDATE (6.6.5 b) | Without it, a `_metadata` condition failed with an internal "missing attribute" error instead of V1's error. Tests 44–45 failed before the fix. |
 | Materialized row tracking columns keep the generated field's metadata (6.6.2 b) | Needed for `DeltaParquetFileFormat` to treat them as internal columns under column mapping, as V1 does. |
+| Dynamic partition pruning (6.7) | **Planning regression.** V1 scans are pruned by DPP; without `SupportsRuntimeV2Filtering`, turning the feature on made star joins read the whole fact table. Implemented on partition values with V1's parsing, and regrouped so the keys stay a subset, as Spark requires for key-grouped scans. |
 | Test cleanup and new tests 6–10, 15 | Line length and style, plus coverage for type parsing, column order, time travel, DML, and the conf guard. |

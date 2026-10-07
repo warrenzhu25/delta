@@ -20,11 +20,12 @@ import java.sql.Date
 
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
-import org.apache.spark.sql.delta.v2.DeltaBatchScan
+import org.apache.spark.sql.delta.v2.{DeltaBatchScan, DeltaKeyGroupedInputPartition}
 
 import org.apache.spark.SparkThrowable
 import org.apache.spark.sql.{DataFrame, QueryTest, Row}
 import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.expressions.{DynamicPruningExpression, Literal}
 import org.apache.spark.sql.catalyst.plans.physical.RangePartitioning
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
@@ -942,6 +943,151 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
         }
       }
       assert(outcomes(spjEnabled = true) === outcomes(spjEnabled = false))
+    }
+  }
+
+  /**
+   * Runs `f` with SPJ and dynamic partition pruning enabled. With `broadcast`, small tables are
+   * broadcast and DPP reuses the broadcast (Spark's default mode). Without it, joins are not
+   * broadcast and DPP runs its own subquery (`reuseBroadcastOnly=false`).
+   */
+  private def withDPPConf[T](broadcast: Boolean)(f: => T): T = withSPJConf(enabled = true) {
+    withSQLConf(
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> (if (broadcast) "10MB" else "-1"),
+      SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> broadcast.toString,
+      SQLConf.DYNAMIC_PARTITION_PRUNING_FALLBACK_FILTER_RATIO.key -> "1.0")(f)
+  }
+
+  /** V2 scans of `plan` with a dynamic partition pruning filter. */
+  private def dppFilteredScans(plan: SparkPlan): Seq[BatchScanExec] = batchScans(plan).filter {
+    _.runtimeFilters.exists {
+      case DynamicPruningExpression(Literal.TrueLiteral) => false
+      case _: DynamicPruningExpression => true
+      case _ => false
+    }
+  }
+
+  /** Number of files `scan` planned to read; after execution this reflects runtime filtering. */
+  private def numPlannedFiles(scan: BatchScanExec): Int =
+    scan.scan.asInstanceOf[DeltaBatchScan].planInputPartitions()
+      .map(_.asInstanceOf[DeltaKeyGroupedInputPartition].files.length).sum
+
+  /**
+   * Checks that `query` returns the same rows with DPP on the V2 scan as with V1, and that one V2
+   * scan was pruned at runtime down to `expectedFiles` files (or not pruned at all, for `None`).
+   * Without `broadcast`, the join must also stay shuffle-free (SPJ).
+   */
+  private def checkDPP(query: String, broadcast: Boolean, expectedFiles: Option[Int]): Unit = {
+    val expected = withSPJConf(enabled = false) { sql(query).collect().toSeq }
+    withDPPConf(broadcast) {
+      val df = sql(query)
+      df.collect()
+      checkAnswer(df, expected)
+      val plan = df.queryExecution.executedPlan
+      val pruned = dppFilteredScans(plan)
+      expectedFiles match {
+        case Some(n) =>
+          assert(pruned.size == 1, s"Expected one V2 scan with a DPP filter:\n$plan")
+          assert(numPlannedFiles(pruned.head) == n)
+        case None =>
+          assert(pruned.isEmpty, s"Expected no DPP filter on V2 scans:\n$plan")
+      }
+      if (!broadcast) {
+        assert(joinShuffles(plan).isEmpty, s"Expected a shuffle-free SPJ join:\n$plan")
+      }
+    }
+  }
+
+  /**
+   * Creates a partitioned fact table `t_fact` with one file in each of the partitions p0..p3, and
+   * a dimension table `t_dim` (partitioned by `part` if `partitionedDim`) mapping p0, p2 to 'US'
+   * and p1, p3 to 'EU'. The fact table is much larger, so DPP is worth it in every mode.
+   */
+  private def createStarSchema(partitionedDim: Boolean, factProps: String = ""): Unit = {
+    sql("CREATE TABLE t_fact (id INT, v STRING, part STRING) USING delta PARTITIONED BY (part)" +
+      factProps)
+    sql("INSERT INTO t_fact SELECT /*+ REPARTITION(1) */ CAST(id AS INT), " +
+      "md5(CAST(id AS STRING)), CONCAT('p', id % 4) FROM range(4000)")
+    sql("CREATE TABLE t_dim (id INT, part STRING, region STRING) USING delta" +
+      (if (partitionedDim) " PARTITIONED BY (part)" else ""))
+    insertValues("t_dim", "(0, 'p0', 'US'), (1, 'p1', 'EU'), (2, 'p2', 'US'), (3, 'p3', 'EU')")
+  }
+
+  private val starQuery = "SELECT f.id, f.v, f.part, d.region FROM t_fact f " +
+    "JOIN t_dim d ON f.part = d.part WHERE d.region = '<region>'"
+
+  test("Dynamic partition pruning prunes the V2 scan in a broadcast join") {
+    withTable("t_fact", "t_dim") {
+      createStarSchema(partitionedDim = false)
+      checkDPP(starQuery.replace("<region>", "US"), broadcast = true, expectedFiles = Some(2))
+    }
+  }
+
+  test("Dynamic partition pruning in a shuffle-free SPJ join") {
+    withTable("t_fact", "t_dim") {
+      createStarSchema(partitionedDim = true)
+      checkDPP(starQuery.replace("<region>", "US"), broadcast = false, expectedFiles = Some(2))
+    }
+  }
+
+  test("Dynamic partition pruning that removes every partition") {
+    withTable("t_fact", "t_dim") {
+      createStarSchema(partitionedDim = true)
+      // Region 'ZZ' only matches a dimension row whose key does not exist in the fact table. (A
+      // region matching no row at all would let data skipping drop every `t_dim` file at planning
+      // time, leaving no partitions to join on.)
+      insertValues("t_dim", "(4, 'p4', 'ZZ')")
+      for (broadcast <- Seq(true, false)) {
+        checkDPP(starQuery.replace("<region>", "ZZ"), broadcast, expectedFiles = Some(0))
+      }
+    }
+  }
+
+  test("Dynamic partition pruning on a table with Deletion Vectors") {
+    withTable("t_fact", "t_dim") {
+      createStarSchema(partitionedDim = false,
+        factProps = " TBLPROPERTIES ('delta.enableDeletionVectors' = 'true')")
+      sql("DELETE FROM t_fact WHERE part IN ('p0', 'p1') AND id % 5 = 0")
+      assert(numFilesWithDVs("t_fact") == 2)
+      checkDPP(starQuery.replace("<region>", "US"), broadcast = true, expectedFiles = Some(2))
+    }
+  }
+
+  test("Dynamic partition pruning with a typed partition column and column mapping") {
+    withTable("t_fact", "t_dim") {
+      sql("CREATE TABLE t_fact (id INT, d DATE) USING delta PARTITIONED BY (d) " +
+        "TBLPROPERTIES ('delta.columnMapping.mode' = 'name')")
+      sql("INSERT INTO t_fact SELECT /*+ REPARTITION(1) */ CAST(id AS INT), " +
+        "DATE_ADD(DATE'2024-01-01', CAST(id % 3 AS INT)) FROM range(3000)")
+      sql("CREATE TABLE t_dim (d DATE, region STRING) USING delta")
+      sql("INSERT INTO t_dim VALUES (DATE'2024-01-01', 'US'), (DATE'2024-01-02', 'EU'), " +
+        "(DATE'2024-01-03', 'US')")
+      checkDPP("SELECT f.id, f.d FROM t_fact f JOIN t_dim d ON f.d = d.d WHERE d.region = 'EU'",
+        broadcast = true, expectedFiles = Some(1))
+    }
+  }
+
+  test("No dynamic partition pruning on data columns or when DPP is disabled") {
+    withTable("t_fact", "t_dim") {
+      createStarSchema(partitionedDim = false)
+      // Join on a data column: the scan only accepts runtime filters on partition columns.
+      checkDPP("SELECT f.id, f.part FROM t_fact f JOIN t_dim d ON f.id = d.id " +
+        "WHERE d.region = 'US'", broadcast = true, expectedFiles = None)
+      withSQLConf(SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "false") {
+        val expected = withSPJConf(enabled = false) {
+          sql(starQuery.replace("<region>", "US")).collect().toSeq
+        }
+        withSPJConf(enabled = true) {
+          withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB") {
+            val df = sql(starQuery.replace("<region>", "US"))
+            checkAnswer(df, expected)
+            val plan = df.queryExecution.executedPlan
+            assert(dppFilteredScans(plan).isEmpty)
+            assert(batchScans(plan).map(numPlannedFiles) == Seq(4))
+          }
+        }
+      }
     }
   }
 

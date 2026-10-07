@@ -36,13 +36,15 @@ import org.apache.spark.paths.SparkPath
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
-import org.apache.spark.sql.catalyst.expressions.{Add, BoundReference, Cast, Coalesce, CreateNamedStruct, Expression, GenericInternalRow, JoinedRow, Literal, UnsafeProjection}
+import org.apache.spark.sql.catalyst.expressions.{Add, And, BindReferences, BoundReference, Cast, Coalesce, CreateNamedStruct, Expression, GenericInternalRow, JoinedRow, Literal, Predicate, UnsafeProjection}
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
-import org.apache.spark.sql.connector.expressions.{Expression => V2Expression, Expressions}
+import org.apache.spark.sql.connector.expressions.{Expression => V2Expression, Expressions, FieldReference, NamedReference}
+import org.apache.spark.sql.connector.expressions.filter.{Predicate => V2Predicate}
 import org.apache.spark.sql.connector.read._
 import org.apache.spark.sql.connector.read.partitioning.{KeyGroupedPartitioning, Partitioning, UnknownPartitioning}
 import org.apache.spark.sql.execution.datasources.{FileFormat, PartitionedFile}
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
+import org.apache.spark.sql.internal.connector.PredicateUtils
 import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.{DataType, LongType, StructField, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
@@ -109,6 +111,7 @@ class DeltaBatchScan(
   with Batch
   with SupportsReportPartitioning
   with SupportsReportStatistics
+  with SupportsRuntimeV2Filtering
   with DeltaLogging {
 
   override def description(): String = s"DeltaBatchScan[${deltaTable.name()}]"
@@ -188,15 +191,26 @@ class DeltaBatchScan(
     DeletionVectorUtils.deletionVectorsReadable(snapshot) &&
       selectedFiles.exists(_.deletionVector != null)
 
-  private lazy val plannedPartitions: Array[InputPartition] = {
+  /** Input partitions planned from all `selectedFiles`. The reported partitioning uses these. */
+  private lazy val originalPartitions: Array[InputPartition] = planPartitionsFor(selectedFiles)
+
+  /**
+   * Files and input partitions left after runtime filtering (dynamic partition pruning), see
+   * [[filter]]. `None` until Spark filters the scan at runtime.
+   */
+  @volatile private var runtimeFilteredFiles: Option[Seq[AddFile]] = None
+  @volatile private var runtimeFilteredPartitions: Option[Array[InputPartition]] = None
+
+  /** Groups `files` by projected partition key when SPJ is eligible, one split per file else. */
+  private def planPartitionsFor(files: Seq[AddFile]): Array[InputPartition] = {
     if (isSPJEligible) {
       val projectedPhysicalCols = projectedPartitionFields.map(DeltaColumnMapping.getPhysicalName)
-      val grouped = selectedFiles.groupBy { f =>
+      val grouped = files.groupBy { f =>
         projectedPhysicalCols.map(col => col -> f.partitionValues.getOrElse(col, null)).toMap
       }.toSeq
       planPartitions(grouped)
     } else {
-      planPartitions(selectedFiles.map(f => (f.partitionValues, Seq(f))))
+      planPartitions(files.map(f => (f.partitionValues, Seq(f))))
     }
   }
 
@@ -265,18 +279,65 @@ class DeltaBatchScan(
     }
   }
 
-  override def planInputPartitions(): Array[InputPartition] = plannedPartitions
+  override def planInputPartitions(): Array[InputPartition] =
+    runtimeFilteredPartitions.getOrElse(originalPartitions)
 
   override def outputPartitioning(): Partitioning = reportedPartitioning
 
   private lazy val reportedPartitioning: Partitioning = {
     if (isSPJEligible) {
       logInfo(log"Reporting KeyGroupedPartitioning with " +
-        log"${MDC(DeltaLogKeys.NUM_PARTITIONS, plannedPartitions.length)} partitions for " +
+        log"${MDC(DeltaLogKeys.NUM_PARTITIONS, originalPartitions.length)} partitions for " +
         log"table ${MDC(DeltaLogKeys.TABLE_NAME, deltaTable.name())}")
-      new KeyGroupedPartitioning(groupingKeyTransforms, plannedPartitions.length)
+      new KeyGroupedPartitioning(groupingKeyTransforms, originalPartitions.length)
     } else {
-      new UnknownPartitioning(plannedPartitions.length)
+      new UnknownPartitioning(originalPartitions.length)
+    }
+  }
+
+  /**
+   * Columns Spark may filter this scan by at runtime (dynamic partition pruning): the partition
+   * columns in `readSchema`. Pruning by data columns would need file statistics and is not
+   * supported.
+   */
+  override def filterAttributes(): Array[NamedReference] =
+    projectedPartitionColumns.map(c => FieldReference.column(c): NamedReference).toArray
+
+  /**
+   * Prunes the selected files with runtime predicates on partition columns (dynamic partition
+   * pruning). Spark then calls [[planInputPartitions]] again. Like V1, the predicates are
+   * evaluated on each file's partition values. Predicates that can't be translated, or that
+   * reference other columns, are ignored: runtime filters only skip files, the join still
+   * filters the rows.
+   *
+   * The grouping keys of the remaining files are a subset of the original ones, as Spark requires
+   * for a scan that reports [[KeyGroupedPartitioning]]; Spark adds empty partitions for the
+   * missing keys. The reported partitioning and statistics are not changed.
+   */
+  override def filter(predicates: Array[V2Predicate]): Unit = {
+    val partitionAttrs = DataTypeUtils.toAttributes(metadata.partitionSchema)
+    val resolver = spark.sessionState.conf.resolver
+    val partitionFilters: Seq[Expression] = predicates.toSeq
+      .flatMap(PredicateUtils.toV1)
+      .flatMap(f => Try(DeltaSourceUtils.translateFilters(Array(f))).toOption)
+      .map(_.transform {
+        case u: UnresolvedAttribute =>
+          partitionAttrs.find(a => resolver(a.name, u.name)).getOrElse(u)
+      })
+      .filter(_.resolved)
+    if (partitionFilters.nonEmpty) {
+      val keep = Predicate.createInterpreted(
+        BindReferences.bindReference(partitionFilters.reduce(And), partitionAttrs))
+      val files = runtimeFilteredFiles.getOrElse(selectedFiles)
+      val remainingFiles = files.filter { f =>
+        keep.eval(extractPartitionRow(f.partitionValues, metadata.partitionSchema))
+      }
+      logInfo(log"Runtime filtering kept " +
+        log"${MDC(DeltaLogKeys.NUM_FILES, remainingFiles.size.toLong)} of " +
+        log"${MDC(DeltaLogKeys.NUM_FILES2, files.size.toLong)} files for table " +
+        log"${MDC(DeltaLogKeys.TABLE_NAME, deltaTable.name())}")
+      runtimeFilteredFiles = Some(remainingFiles)
+      runtimeFilteredPartitions = Some(planPartitionsFor(remainingFiles))
     }
   }
 
