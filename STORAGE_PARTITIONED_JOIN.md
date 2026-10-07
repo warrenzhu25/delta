@@ -97,8 +97,8 @@ have to sort its partitions.
 | `spark/src/main/scala/org/apache/spark/sql/delta/sources/DeltaSQLConf.scala` | New conf `storagePartitionedJoin.enabled` | +11 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/FallbackToV1Relations.scala` | Keep V2 relation when the table qualifies | +34 / -1 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/catalog/DeltaTableV2.scala` | `with SupportsRead`, `newScanBuilder` | +8 / -1 |
-| `spark/src/main/scala/org/apache/spark/sql/delta/v2/DeltaScanBuilder.scala` | **New.** Scan builder, scan, input partition, reader factory, reader | ~400 |
-| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 24 tests | ~620 |
+| `spark/src/main/scala/org/apache/spark/sql/delta/v2/DeltaScanBuilder.scala` | **New.** Scan builder, scan (with statistics), input partition, reader factory, reader | ~440 |
+| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 26 tests | ~670 |
 
 No other code paths change when the conf is `false`. The only extra work is two conf lookups per
 Delta relation during analysis.
@@ -303,7 +303,8 @@ class DeltaScanBuilder(spark, deltaTable, tableSchema, options)
 ```scala
 class DeltaBatchScan(val spark, val deltaTable, val tableSchema, val readSchema,
     val pushedFilters, val options)
-  extends Scan with Batch with SupportsReportPartitioning with DeltaLogging {
+  extends Scan with Batch with SupportsReportPartitioning with SupportsReportStatistics
+  with DeltaLogging {
 
   override def description(): String = s"DeltaBatchScan[${deltaTable.name()}]"   // shown in EXPLAIN
   override def toBatch: Batch = this
@@ -336,7 +337,7 @@ class DeltaBatchScan(val spark, val deltaTable, val tableSchema, val readSchema,
 #### 6.4.3 `DeltaBatchScan.plannedPartitions`: pruning and grouping
 
 ```scala
-private lazy val plannedPartitions: Array[InputPartition] = {
+private lazy val selectedFiles: Seq[AddFile] = {
   // (a) Convert pushed V1 Filters to resolved Catalyst expressions
   val attrMap = DataTypeUtils.toAttributes(tableSchema).map(a => a.name -> a).toMap
   val catalystFilters: Seq[Expression] = pushedFilters.toSeq.flatMap { f =>
@@ -346,17 +347,20 @@ private lazy val plannedPartitions: Array[InputPartition] = {
   }.filter(_.resolved)
 
   // (b) Delta log pruning: partition pruning + data skipping
-  val addFiles: Seq[AddFile] = snapshot.filesForScan(catalystFilters).files
+  snapshot.filesForScan(catalystFilters).files
+}
+
+private lazy val plannedPartitions: Array[InputPartition] = {
 
   // (c) Group files by partition key
   if (isSPJEligible) {
     val projectedPhysicalCols = projectedPartitionFields.map(DeltaColumnMapping.getPhysicalName)
-    val grouped = addFiles.groupBy { f =>
+    val grouped = selectedFiles.groupBy { f =>
       projectedPhysicalCols.map(col => col -> f.partitionValues.getOrElse(col, null)).toMap
     }.toSeq
     planPartitions(grouped)
   } else {
-    planPartitions(addFiles.map(f => (f.partitionValues, Seq(f))))   // one split per file
+    planPartitions(selectedFiles.map(f => (f.partitionValues, Seq(f))))   // one split per file
   }
 }
 ```
@@ -373,8 +377,10 @@ private lazy val plannedPartitions: Array[InputPartition] = {
   *projected* partition columns only. Files from different full partitions (`US/CA`, `US/NY`)
   share a group when only `region` is projected. The `else` branch makes one split per file when
   SPJ doesn't apply.
-- It is a `lazy val`, so the Delta log is scanned once per scan, even though Spark calls both
-  `outputPartitioning()` and `planInputPartitions()`.
+- `selectedFiles` and `plannedPartitions` are `lazy val`s, so the Delta log is scanned once per
+  scan, even though Spark calls `estimateStatistics()`, `outputPartitioning()` and
+  `planInputPartitions()`. `selectedFiles` is separate so statistics (6.4.6a) use the same
+  pruned file list.
 
 #### 6.4.4 Turning partition strings into typed rows
 
@@ -441,6 +447,35 @@ private lazy val reportedPartitioning: Partitioning =
 - Computed once and logged once, using Delta's structured logging (`log"..."` with `MDC`).
 - `numPartitions` must equal the length of `planInputPartitions()`. Both come from the same
   `plannedPartitions`.
+
+#### 6.4.6a Reporting statistics
+
+```scala
+private lazy val scanStatistics: Statistics = {
+  val compressionFactor = spark.sessionState.conf.fileCompressionFactor
+  val totalSize = (selectedFiles.map(_.size).sum * compressionFactor).toLong
+  new Statistics {
+    override def sizeInBytes(): OptionalLong = OptionalLong.of(totalSize)
+    override def numRows(): OptionalLong = OptionalLong.empty()
+  }
+}
+
+override def estimateStatistics(): Statistics = scanStatistics
+```
+
+- **Why it's needed:** if a V2 `Scan` doesn't implement `SupportsReportStatistics`, Spark sizes it
+  as `spark.sql.defaultSizeInBytes` (`Long.MaxValue` by default). Small tables then never get
+  **broadcast** and Spark falls back to sort-merge joins. The V1 path gets its size from
+  `HadoopFsRelation`, so without this, turning the feature on would make plans worse. The test
+  "Small tables read through the V2 scan are still broadcast" failed (`SortMergeJoin`) before the
+  fix.
+- **Size:** total size of the *selected* (pruned) files times `fileCompressionFactor`, matching
+  V1's `HadoopFsRelation.sizeInBytes`. Spark's planner further scales it down for column pruning.
+- **No row count**, like V1. `filesForScan` drops per-file stats unless called with
+  `keepNumRecords = true`, which would parse every file's stats JSON even for unfiltered scans.
+  That is a possible follow-up if CBO row counts are wanted.
+- The local name `totalSize` must differ from the interface method `sizeInBytes`; otherwise the
+  anonymous class's method would call itself.
 
 #### 6.4.7 `DeltaScanFileInfo` and `DeltaKeyGroupedInputPartition`
 
@@ -655,7 +690,7 @@ V1 output directly.
 
 ## 10. Test Suite
 
-`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 24
+`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 26
 tests.
 
 **Setup (`withSPJConf`):** turns on both SPJ confs, `pushPartValues=true`,
@@ -688,15 +723,17 @@ deterministic.
 | 13 | Empty partitioned table in SPJ falls back to shuffle without error | Empty side. |
 | 14 | Fallback to V1 reader when SPJ is disabled | Delta conf off. |
 | 15 | Fallback to V1 reader when Spark V2 bucketing is disabled | Spark conf off. |
-| 16 | E2E SPJ: Three-way partitioned join without shuffle exchanges | 3 scans, no shuffle. |
-| 17 | E2E SPJ: Aggregation with group by partition key avoids shuffle exchange | No shuffle at all. |
-| 18 | E2E SPJ: Subquery / Semi-Join on partition key avoids shuffle exchange | `IN (subquery)`. |
-| 19 | E2E SPJ: Left, Right, and Full Outer Joins without shuffle exchanges | NULL-padded results. |
-| 20 | E2E SPJ: Join keys subset of partition keys (allowJoinKeysSubsetOfPartitionKeys) | Covers 7.1. |
-| 21 | SPJ with WHERE partition filter pushdown prunes non-matching partitions | One input partition per side. |
-| 22 | Deletion Vector enabled table safely falls back to V1 and filters deleted rows | Only the table without DVs uses V2. |
-| 23 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
-| 24 | SPJ with tables containing NULL partition values | NULL keys. |
+| 16 | Small tables read through the V2 scan are still broadcast | Broadcast join enabled; both sides V2; expects `BroadcastHashJoinExec` (6.4.6a). |
+| 17 | V2 scan reports the size of the selected files | `estimateStatistics().sizeInBytes` equals the snapshot size, and the pruned partition's size with a partition filter. |
+| 18 | E2E SPJ: Three-way partitioned join without shuffle exchanges | 3 scans, no shuffle. |
+| 19 | E2E SPJ: Aggregation with group by partition key avoids shuffle exchange | No shuffle at all. |
+| 20 | E2E SPJ: Subquery / Semi-Join on partition key avoids shuffle exchange | `IN (subquery)`. |
+| 21 | E2E SPJ: Left, Right, and Full Outer Joins without shuffle exchanges | NULL-padded results. |
+| 22 | E2E SPJ: Join keys subset of partition keys (allowJoinKeysSubsetOfPartitionKeys) | Covers 7.1. |
+| 23 | SPJ with WHERE partition filter pushdown prunes non-matching partitions | One input partition per side. |
+| 24 | Deletion Vector enabled table safely falls back to V1 and filters deleted rows | Only the table without DVs uses V2. |
+| 25 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
+| 26 | SPJ with tables containing NULL partition values | NULL keys. |
 
 ---
 
@@ -730,4 +767,5 @@ Changes made while preparing the PR, and why:
 | Pass only data-column filters to Parquet (6.4.8 c) | Needed by the fix above. Otherwise automatic `IsNotNull(partCol)` filters drop every row. Matches V1. |
 | Require `spark.sql.sources.v2.bucketing.enabled` | Without it the V2 scan gives no benefit and only adds risk. |
 | Compute the reported partitioning once, with structured logging | `outputPartitioning()` is called more than once; Delta requires `log"..."`/`MDC` logging. |
+| Report scan statistics (6.4.6a) | **Planning regression.** Without statistics, Spark treats the V2 scan as infinitely large, so small tables stopped being broadcast when the feature was on. Test 16 failed before the fix. |
 | Test cleanup and new tests 6–10, 15 | Line length and style, plus coverage for type parsing, column order, time travel, DML, and the conf guard. |

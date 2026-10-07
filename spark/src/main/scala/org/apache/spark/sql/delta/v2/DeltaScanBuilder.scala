@@ -17,7 +17,7 @@
 package org.apache.spark.sql.delta.v2
 
 import java.net.URI
-import java.util.Locale
+import java.util.{Locale, OptionalLong}
 
 import scala.util.Try
 
@@ -105,6 +105,7 @@ class DeltaBatchScan(
   extends Scan
   with Batch
   with SupportsReportPartitioning
+  with SupportsReportStatistics
   with DeltaLogging {
 
   override def description(): String = s"DeltaBatchScan[${deltaTable.name()}]"
@@ -161,7 +162,7 @@ class DeltaBatchScan(
    * - Prunes files in the Delta Snapshot using pushed filters (partition pruning & data skipping).
    * - Groups matching AddFiles by projected partition key when SPJ is eligible.
    */
-  private lazy val plannedPartitions: Array[InputPartition] = {
+  private lazy val selectedFiles: Seq[AddFile] = {
     val attrMap = DataTypeUtils.toAttributes(tableSchema).map(a => a.name -> a).toMap
     // Filters that cannot be translated or resolved are skipped here; they are still applied
     // by Spark after the scan since all pushed filters are reported as residuals.
@@ -173,18 +174,38 @@ class DeltaBatchScan(
       }
     }.filter(_.resolved)
 
-    val addFiles: Seq[AddFile] = snapshot.filesForScan(catalystFilters).files
+    snapshot.filesForScan(catalystFilters).files
+  }
 
+  private lazy val plannedPartitions: Array[InputPartition] = {
     if (isSPJEligible) {
       val projectedPhysicalCols = projectedPartitionFields.map(DeltaColumnMapping.getPhysicalName)
-      val grouped = addFiles.groupBy { f =>
+      val grouped = selectedFiles.groupBy { f =>
         projectedPhysicalCols.map(col => col -> f.partitionValues.getOrElse(col, null)).toMap
       }.toSeq
       planPartitions(grouped)
     } else {
-      planPartitions(addFiles.map(f => (f.partitionValues, Seq(f))))
+      planPartitions(selectedFiles.map(f => (f.partitionValues, Seq(f))))
     }
   }
+
+  /**
+   * Statistics of the selected files, used by Spark's planner (e.g. to pick broadcast joins).
+   * Without them Spark assumes `spark.sql.defaultSizeInBytes` (effectively infinite).
+   * Like V1 (`HadoopFsRelation.sizeInBytes`), only the size is reported: the total size of the
+   * selected files scaled by `spark.sql.sources.fileCompressionFactor`. A row count is not
+   * reported because `filesForScan` doesn't keep per-file record counts by default.
+   */
+  private lazy val scanStatistics: Statistics = {
+    val compressionFactor = spark.sessionState.conf.fileCompressionFactor
+    val totalSize = (selectedFiles.map(_.size).sum * compressionFactor).toLong
+    new Statistics {
+      override def sizeInBytes(): OptionalLong = OptionalLong.of(totalSize)
+      override def numRows(): OptionalLong = OptionalLong.empty()
+    }
+  }
+
+  override def estimateStatistics(): Statistics = scanStatistics
 
   private def extractPartitionRow(
       partValuesMap: Map[String, String],
