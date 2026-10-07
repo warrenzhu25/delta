@@ -42,19 +42,28 @@ object FallbackToV1DeltaRelation {
 
   /**
    * Returns true if the relation should stay a [[DataSourceV2Relation]] so that it is planned as
-   * a `BatchScanExec` that reports `KeyGroupedPartitioning`. This requires:
+   * a `BatchScanExec` that reports `KeyGroupedPartitioning`. This requires the table to be
+   * eligible (see [[isTableEligibleForV2Read]]) and the read not to be a CDC read.
+   */
+  private def shouldKeepAsV2ForSPJ(d: DeltaTableV2, dsv2: DataSourceV2Relation): Boolean = {
+    !CDCReader.isCDCRead(dsv2.options) && isTableEligibleForV2Read(d)
+  }
+
+  /**
+   * Whether reads of the table use the V2 scan (CDC reads excepted, see
+   * [[shouldKeepAsV2ForSPJ]]). This requires:
    *  - both Delta's SPJ flag and Spark's V2 bucketing flag to be enabled (otherwise the V2 scan
    *    gives no benefit over the V1 scan);
    *  - the table to be partitioned;
-   *  - not a CDC read;
    *  - no Deletion Vectors, unless DV support in the V2 scan is enabled.
    * The cheap configuration checks are evaluated first to avoid loading the snapshot otherwise.
+   * Also used by [[DeltaTableV2.metadataColumns]], so that the `_metadata` column is only exposed
+   * on relations that stay V2.
    */
-  private def shouldKeepAsV2ForSPJ(d: DeltaTableV2, dsv2: DataSourceV2Relation): Boolean = {
+  private[delta] def isTableEligibleForV2Read(d: DeltaTableV2): Boolean = {
     val conf = d.spark.sessionState.conf
     val enabled = conf.getConf(DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_ENABLED) &&
-      conf.getConf(SQLConf.V2_BUCKETING_ENABLED) &&
-      !CDCReader.isCDCRead(dsv2.options)
+      conf.getConf(SQLConf.V2_BUCKETING_ENABLED)
     enabled && {
       val snapshot = d.initialSnapshot
       snapshot.metadata.partitionColumns.nonEmpty &&

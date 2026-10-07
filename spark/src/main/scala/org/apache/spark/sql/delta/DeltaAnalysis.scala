@@ -68,10 +68,11 @@ import org.apache.spark.sql.connector.expressions.{FieldReference, IdentityTrans
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.command.CreateTableLikeCommand
 import org.apache.spark.sql.execution.command.RunnableCommand
-import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation, LogicalRelationWithTable}
+import org.apache.spark.sql.execution.datasources.{FileFormat, HadoopFsRelation, LogicalRelation, LogicalRelationWithTable}
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, DataSourceV2RelationShim}
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.sources.BaseRelation
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
@@ -585,7 +586,8 @@ class DeltaAnalysis(protected val session: SparkSession)
 
     case d @ DeleteFromTable(table, condition) if d.childrenResolved =>
       // rewrites Delta from V2 to V1
-      val newTarget = stripTempViewWrapper(table).transformUp { case DeltaRelation(lr) => lr }
+      val (newTarget, rewriteMetadataRefs) =
+        DeltaRelation.toV1WithMetadataReferences(stripTempViewWrapper(table))
       val indices = newTarget.collect {
         case DeltaFullTable(_, index) => index
       }
@@ -594,19 +596,23 @@ class DeltaAnalysis(protected val session: SparkSession)
         d
       } else if (indices.size == 1 && indices(0).deltaLog.tableExists) {
         // It is a well-defined Delta table with a schema
-        DeltaDelete(newTarget, Some(condition))
+        DeltaDelete(newTarget, Some(condition.transform(rewriteMetadataRefs)))
       } else {
         // Not a well-defined Delta table
         throw DeltaErrors.notADeltaSourceException("DELETE", Some(d))
       }
 
     case u @ UpdateTable(table, assignments, condition) if u.childrenResolved =>
-      val (cols, expressions) = assignments.map(a => a.key -> a.value).unzip
       // rewrites Delta from V2 to V1
-      val newTable = stripTempViewWrapper(table).transformUp { case DeltaRelation(lr) => lr }
+      val (newTable, rewriteMetadataRefs) =
+        DeltaRelation.toV1WithMetadataReferences(stripTempViewWrapper(table))
+      val (cols, expressions) = assignments.map { a =>
+        a.key.transform(rewriteMetadataRefs) -> a.value.transform(rewriteMetadataRefs)
+      }.unzip
         newTable.collectLeaves().headOption match {
           case Some(DeltaFullTable(_, index)) =>
-            DeltaUpdateTable(newTable, cols, expressions, condition)
+            DeltaUpdateTable(
+              newTable, cols, expressions, condition.map(_.transform(rewriteMetadataRefs)))
           case o =>
             // not a Delta table
             u
@@ -1170,9 +1176,89 @@ object DeltaRelation extends DeltaLogging {
           }.getOrElse(a)
         }
       } else {
-        v2Relation.output
+        v2Relation.output.map(toV1FileMetadataAttribute(relation, _))
       }
       LogicalRelation(relation, output, d.ttSafeCatalogTable, isStreaming = false, stream = None)
+    }
+  }
+
+  /**
+   * When reads of a table use the Storage-Partitioned Join V2 scan, `DeltaTableV2` exposes the
+   * `_metadata` column and Spark may resolve it on the V2 relation. If that relation is later
+   * converted to V1 anyway (e.g. as a DML target), replace the V2 metadata attribute by the V1
+   * file source metadata attribute, keeping its expression ID, so references above stay valid and
+   * the V1 scan fills it in. Both have the same data type, as both come from
+   * `DeltaParquetFileFormat`.
+   */
+  private def toV1FileMetadataAttribute(
+      relation: BaseRelation,
+      attr: AttributeReference): AttributeReference =
+    (relation, attr) match {
+      case (fsRelation: HadoopFsRelation, MetadataAttribute(metadataAttr))
+          if metadataAttr.name == FileFormat.METADATA_NAME &&
+            !FileSourceMetadataAttribute.isValid(metadataAttr.metadata) =>
+        val v1Attr = fsRelation.fileFormat.createFileMetadataCol()
+        if (v1Attr.dataType == metadataAttr.dataType) {
+          v1Attr.withExprId(metadataAttr.exprId).withQualifier(metadataAttr.qualifier)
+        } else {
+          attr
+        }
+      case _ => attr
+    }
+
+  /**
+   * Converts the Delta relations in `plan` to V1, like
+   * `plan.transformUp { case DeltaRelation(lr) => lr }`, and returns a rule that rewrites
+   * references to the `_metadata` column of the converted V2 relations into references to the
+   * `_metadata` column of the V1 relations.
+   *
+   * DELETE and UPDATE convert their target to V1 as soon as their children are resolved. With the
+   * Storage-Partitioned Join V2 scan, their expressions may already reference the V2 relation's
+   * `_metadata` column (resolved from its `metadataOutput`) while that column was not yet added
+   * to the V2 relation's output. Such references must be moved to the V1 relation's
+   * `metadataOutput`, so that Spark adds the V1 `_metadata` column to it as usual and the command
+   * behaves as with the V1 scan. (MERGE rejects references to the target's `_metadata` either
+   * way.)
+   */
+  def toV1WithMetadataReferences(
+      plan: LogicalPlan): (LogicalPlan, PartialFunction[Expression, Expression]) = {
+    var metadataAttrs = Map.empty[ExprId, AttributeReference]
+    val newPlan = plan.transformUp {
+      case relation @ DeltaRelation(lr) =>
+        relation match {
+          case v2Relation: DataSourceV2Relation =>
+            metadataAttrs ++= v1MetadataAttributeFor(v2Relation, lr)
+          case _ =>
+        }
+        lr
+    }
+    val rewrite: PartialFunction[Expression, Expression] = {
+      case a: AttributeReference if metadataAttrs.contains(a.exprId) => metadataAttrs(a.exprId)
+    }
+    (newPlan, rewrite)
+  }
+
+  /**
+   * Maps the `_metadata` attribute of `v2Relation.metadataOutput` to the one of
+   * `lr.metadataOutput`, unless `lr` already outputs a `_metadata` column (a table column, or the
+   * V2 metadata column already added to the V2 output, see `toV1FileMetadataAttribute`).
+   */
+  private def v1MetadataAttributeFor(
+      v2Relation: DataSourceV2Relation,
+      lr: LogicalRelation): Option[(ExprId, AttributeReference)] = {
+    if (lr.output.exists(_.name == FileFormat.METADATA_NAME)) {
+      None
+    } else {
+      for {
+        v2Attr <- v2Relation.metadataOutput.collectFirst {
+          case a: AttributeReference
+              if a.name == FileFormat.METADATA_NAME && MetadataAttribute.isValid(a.metadata) => a
+        }
+        v1Attr <- lr.metadataOutput.collectFirst {
+          case a: AttributeReference
+              if a.name == FileFormat.METADATA_NAME && a.dataType == v2Attr.dataType => a
+        }
+      } yield v2Attr.exprId -> v1Attr
     }
   }
 }

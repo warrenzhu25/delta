@@ -22,6 +22,7 @@ import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
 import org.apache.spark.sql.delta.v2.DeltaBatchScan
 
+import org.apache.spark.SparkThrowable
 import org.apache.spark.sql.{DataFrame, QueryTest, Row}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.plans.physical.RangePartitioning
@@ -755,6 +756,192 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
           assert(batchScans(query.queryExecution.executedPlan).size == 1)
         }
       }
+    }
+  }
+
+  /**
+   * Checks that `query` returns the same rows with SPJ enabled as with the V1 reader, and that
+   * with SPJ enabled the table is (or is not) read through the V2 scan.
+   */
+  private def checkMatchesV1(query: => DataFrame, expectV2: Boolean = true): Unit = {
+    val expected = withSPJConf(enabled = false) { query.collect().toSeq }
+    withSPJConf(enabled = true) {
+      val df = query
+      checkAnswer(df, expected)
+      assert(batchScans(df.queryExecution.executedPlan).nonEmpty == expectV2,
+        s"Expected V2 scan: $expectV2\n${df.queryExecution.executedPlan}")
+    }
+  }
+
+  private val fileMetadataFields = Seq("file_path", "file_name", "file_size", "file_block_start",
+    "file_block_length", "file_modification_time")
+
+  test("_metadata file fields read through the V2 scan match V1") {
+    withTable("t_md") {
+      sql("CREATE TABLE t_md (id INT, v STRING, part STRING) USING delta PARTITIONED BY (part)")
+      insertValues("t_md", "(1, 'a', 'p1'), (2, 'b', 'p1'), (3, 'c', 'p2')")
+      insertValues("t_md", "(4, 'd', 'p2'), (5, 'e', 'p3')")
+
+      fileMetadataFields.foreach { field =>
+        checkMatchesV1(sql(s"SELECT id, part, _metadata.$field FROM t_md"))
+      }
+      checkMatchesV1(sql("SELECT id, _metadata FROM t_md"))
+      checkMatchesV1(sql("SELECT _metadata.file_name, count(*) FROM t_md GROUP BY 1"))
+      // Only `_metadata`, no data or partition column.
+      checkMatchesV1(sql("SELECT _metadata.file_size FROM t_md"))
+
+      // A filter on a `_metadata` field is evaluated after the scan.
+      val fileName = withSPJConf(enabled = false) {
+        sql("SELECT _metadata.file_name FROM t_md WHERE id = 3").head().getString(0)
+      }
+      checkMatchesV1(sql(s"SELECT id FROM t_md WHERE _metadata.file_name = '$fileName'"))
+      withSPJConf(enabled = true) {
+        checkAnswer(sql(s"SELECT id FROM t_md WHERE _metadata.file_name = '$fileName'"),
+          Seq(Row(3)))
+      }
+
+      // DataFrame API.
+      checkMatchesV1(spark.table("t_md").select("id", "_metadata.file_path", "part"))
+    }
+  }
+
+  test("A table column named _metadata hides the metadata column in the V2 scan") {
+    withTable("t_md") {
+      sql("CREATE TABLE t_md (id INT, _metadata STRING, part STRING) USING delta " +
+        "PARTITIONED BY (part)")
+      insertValues("t_md", "(1, 'x', 'p1'), (2, 'y', 'p2')")
+      checkMatchesV1(sql("SELECT id, _metadata, part FROM t_md"))
+      withSPJConf(enabled = true) {
+        checkAnswer(sql("SELECT id, _metadata FROM t_md"), Seq(Row(1, "x"), Row(2, "y")))
+      }
+    }
+  }
+
+  test("SPJ join selecting _metadata columns avoids shuffle") {
+    withTable("t_md1", "t_md2") {
+      sql("CREATE TABLE t_md1 (id INT, part STRING) USING delta PARTITIONED BY (part)")
+      sql("CREATE TABLE t_md2 (id INT, part STRING) USING delta PARTITIONED BY (part)")
+      insertValues("t_md1", "(1, 'p1'), (2, 'p2'), (3, 'p3')")
+      insertValues("t_md2", "(10, 'p1'), (20, 'p2'), (30, 'p3')")
+      checkSPJAnswerMatchesV1("SELECT t1.id, t1._metadata.file_name, t2.id, " +
+        "t2._metadata.file_size, t1.part FROM t_md1 t1 JOIN t_md2 t2 ON t1.part = t2.part")
+    }
+  }
+
+  for (useMetadataRowIndex <- Seq(true, false)) {
+    test(s"_metadata.row_index on a Deletion Vector table - " +
+        s"useMetadataRowIndex=$useMetadataRowIndex") {
+      withSQLConf(
+        DeltaSQLConf.DELETION_VECTORS_USE_METADATA_ROW_INDEX.key -> useMetadataRowIndex.toString) {
+        withTable("t_dv1") {
+          createDVTable("t_dv1")
+          insertValues("t_dv1", "(1, 'a', 'p1'), (2, 'b', 'p1'), (3, 'c', 'p1'), " +
+            "(4, 'd', 'p2'), (5, 'e', 'p2')")
+          sql("DELETE FROM t_dv1 WHERE id IN (2, 4)")
+          assert(numFilesWithDVs("t_dv1") == 2)
+          checkMatchesV1(sql("SELECT id, part, _metadata.row_index FROM t_dv1"))
+          checkMatchesV1(sql("SELECT id, _metadata.row_index, _metadata.file_name FROM t_dv1"))
+          withSPJConf(enabled = true) {
+            checkAnswer(sql("SELECT id, _metadata.row_index FROM t_dv1"),
+              Seq(Row(1, 0L), Row(3, 2L), Row(5, 1L)))
+          }
+        }
+      }
+    }
+  }
+
+  for {
+    cmMode <- Seq("none", "name")
+    withDVs <- Seq(false, true)
+  } test(s"Row tracking _metadata fields read through the V2 scan match V1 - " +
+      s"columnMapping=$cmMode, deletionVectors=$withDVs") {
+    withTable("t_rt") {
+      sql("CREATE TABLE t_rt (id INT, v STRING, part STRING) USING delta PARTITIONED BY (part) " +
+        "TBLPROPERTIES ('delta.enableRowTracking' = 'true', " +
+        s"'delta.columnMapping.mode' = '$cmMode', 'delta.enableDeletionVectors' = '$withDVs')")
+      insertValues("t_rt", "(1, 'a', 'p1'), (2, 'b', 'p1'), (3, 'c', 'p2')")
+      insertValues("t_rt", "(4, 'd', 'p2'), (5, 'e', 'p3')")
+
+      val query = "SELECT id, v, part, _metadata.row_id, _metadata.row_commit_version, " +
+        "_metadata.base_row_id, _metadata.default_row_commit_version, _metadata.row_index " +
+        "FROM t_rt"
+      // Before any update, row IDs are computed from base_row_id + row_index.
+      checkMatchesV1(sql(query))
+      // After an UPDATE, the rewritten rows carry materialized row IDs and commit versions.
+      sql("UPDATE t_rt SET v = 'updated' WHERE id IN (1, 4)")
+      sql("DELETE FROM t_rt WHERE id = 5")
+      if (withDVs) assert(numFilesWithDVs("t_rt") > 0)
+      checkMatchesV1(sql(query))
+      checkMatchesV1(sql("SELECT id, _metadata.row_id FROM t_rt"))
+      checkMatchesV1(sql("SELECT _metadata FROM t_rt"))
+      // Row IDs are stable across the UPDATE.
+      withSPJConf(enabled = true) {
+        val rowIds = sql("SELECT id, _metadata.row_id FROM t_rt").collect()
+        assert(rowIds.map(_.getLong(1)).distinct.length == rowIds.length)
+      }
+    }
+  }
+
+  test("_metadata on an unpartitioned table with SPJ enabled still uses V1") {
+    withTable("t_unpart") {
+      sql("CREATE TABLE t_unpart (id INT, v STRING) USING delta")
+      sql("INSERT INTO t_unpart VALUES (1, 'a'), (2, 'b')")
+      checkMatchesV1(sql("SELECT id, _metadata.file_name FROM t_unpart"), expectV2 = false)
+    }
+  }
+
+  test("Change data feed reads work with SPJ enabled") {
+    withTable("t_cdf") {
+      sql("CREATE TABLE t_cdf (id INT, part STRING) USING delta PARTITIONED BY (part) " +
+        "TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')")
+      sql("INSERT INTO t_cdf VALUES (1, 'p1'), (2, 'p2')")
+      sql("DELETE FROM t_cdf WHERE id = 2")
+      checkMatchesV1(
+        spark.read.option("readChangeFeed", "true").option("startingVersion", "0")
+          .table("t_cdf").select("id", "part", "_change_type", "_commit_version"),
+        expectV2 = false)
+      checkMatchesV1(
+        sql("SELECT id, part, _change_type FROM table_changes('t_cdf', 0)"),
+        expectV2 = false)
+    }
+  }
+
+  for (withDVs <- Seq(false, true)) {
+    test(s"DML filtering on _metadata behaves the same with SPJ enabled as with V1 - " +
+        s"deletionVectors=$withDVs") {
+      // V1 rejects some of these statements (e.g. when it writes the rewritten files, as
+      // `_metadata` is not a table column). With SPJ enabled, the `_metadata` references
+      // resolved on the V2 target must be moved to the V1 target
+      // (`DeltaRelation.toV1WithMetadataReferences`) to get the same outcome instead of an
+      // internal "missing attribute" error.
+      // Runs each statement on a fresh table and returns its outcome: the error condition, or the
+      // resulting table contents.
+      def outcomes(spjEnabled: Boolean): Seq[String] = withSPJConf(spjEnabled) {
+        Seq(
+          "UPDATE t_md SET v = 'updated' WHERE _metadata.file_name = '<file>'",
+          "DELETE FROM t_md WHERE _metadata.file_name = '<file>'",
+          "MERGE INTO t_md t USING (SELECT 3 AS id) s ON t.id = s.id " +
+            "AND t._metadata.file_name = '<file>' WHEN MATCHED THEN UPDATE SET v = 'merged'"
+        ).map { statement =>
+          var outcome = ""
+          withTable("t_md") {
+            sql("CREATE TABLE t_md (id INT, v STRING, part STRING) USING delta " +
+              s"PARTITIONED BY (part) TBLPROPERTIES ('delta.enableDeletionVectors' = '$withDVs')")
+            insertValues("t_md", "(1, 'a', 'p1'), (2, 'b', 'p2')")
+            insertValues("t_md", "(3, 'c', 'p1'), (4, 'd', 'p1')")
+            val file =
+              sql("SELECT _metadata.file_name FROM t_md WHERE id = 3").head().getString(0)
+            outcome = try {
+              sql(statement.replace("<file>", file))
+              sql("SELECT id, v FROM t_md ORDER BY id").collect().mkString(",")
+            } catch {
+              case e: SparkThrowable => e.getCondition
+            }
+          }
+          outcome
+        }
+      }
+      assert(outcomes(spjEnabled = true) === outcomes(spjEnabled = false))
     }
   }
 

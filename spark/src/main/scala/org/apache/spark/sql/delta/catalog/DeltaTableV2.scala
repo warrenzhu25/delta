@@ -43,7 +43,7 @@ import org.apache.spark.sql.catalyst.analysis.{ResolvedTable, UnresolvedTable}
 import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogTableType, CatalogUtils}
 import org.apache.spark.sql.catalyst.plans.logical.{AnalysisHelper, LogicalPlan, SubqueryAlias}
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
-import org.apache.spark.sql.connector.catalog.{SupportsRead, SupportsWrite, Table, TableCapability, TableCatalog, V2TableWithV1Fallback}
+import org.apache.spark.sql.connector.catalog.{MetadataColumn, SupportsMetadataColumns, SupportsRead, SupportsWrite, Table, TableCapability, TableCatalog, V2TableWithV1Fallback}
 import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
 import org.apache.spark.sql.connector.catalog.TableCapability._
 import org.apache.spark.sql.connector.catalog.V1Table
@@ -51,9 +51,9 @@ import org.apache.spark.sql.connector.expressions._
 import org.apache.spark.sql.connector.read.ScanBuilder
 import org.apache.spark.sql.connector.write.{LogicalWriteInfo, SupportsDynamicOverwrite, SupportsOverwrite, SupportsTruncate, V1Write, WriteBuilder}
 import org.apache.spark.sql.errors.QueryCompilationErrors
-import org.apache.spark.sql.execution.datasources.LogicalRelation
+import org.apache.spark.sql.execution.datasources.{FileFormat, LogicalRelation}
 import org.apache.spark.sql.sources.{BaseRelation, Filter, InsertableRelation}
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{DataType, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.util.{Clock, SystemClock}
 
@@ -72,6 +72,7 @@ class DeltaTableV2 private(
     val options: Map[String, String])
   extends Table
   with SupportsRead
+  with SupportsMetadataColumns
   with SupportsWrite
   with V2TableWithV1Fallback
   with DeltaLogging
@@ -282,6 +283,26 @@ class DeltaTableV2 private(
 
   override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
     new DeltaScanBuilder(spark, this, tableSchema, options)
+  }
+
+  /**
+   * Exposes the `_metadata` column, with the same type as the V1 file source, but only when reads
+   * of this table use the V2 scan (see [[FallbackToV1DeltaRelation.isTableEligibleForV2Read]]).
+   * Otherwise no metadata column is exposed and `_metadata` is resolved by the V1
+   * `LogicalRelation` after the relation falls back to V1, exactly as before.
+   */
+  override def metadataColumns(): Array[MetadataColumn] = {
+    if (tableExists && FallbackToV1DeltaRelation.isTableEligibleForV2Read(this)) {
+      val metadataType = DeltaParquetFileFormat(initialSnapshot.protocol, initialSnapshot.metadata)
+        .createFileMetadataCol().dataType
+      Array(new MetadataColumn {
+        override def name(): String = FileFormat.METADATA_NAME
+        override def dataType(): DataType = metadataType
+        override def isNullable(): Boolean = false
+      })
+    } else {
+      Array.empty
+    }
   }
 
   override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder = {

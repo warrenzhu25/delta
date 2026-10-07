@@ -36,7 +36,7 @@ import org.apache.spark.paths.SparkPath
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
-import org.apache.spark.sql.catalyst.expressions.{BoundReference, Cast, Expression, GenericInternalRow, Literal, UnsafeProjection}
+import org.apache.spark.sql.catalyst.expressions.{Add, BoundReference, Cast, Coalesce, CreateNamedStruct, Expression, GenericInternalRow, JoinedRow, Literal, UnsafeProjection}
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.connector.expressions.{Expression => V2Expression, Expressions}
 import org.apache.spark.sql.connector.read._
@@ -44,7 +44,7 @@ import org.apache.spark.sql.connector.read.partitioning.{KeyGroupedPartitioning,
 import org.apache.spark.sql.execution.datasources.{FileFormat, PartitionedFile}
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.sources.Filter
-import org.apache.spark.sql.types.{LongType, StructField, StructType}
+import org.apache.spark.sql.types.{DataType, LongType, StructField, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.util.SerializableConfiguration
 
@@ -346,6 +346,14 @@ case class DeltaKeyGroupedInputPartition(
  * [[DeltaParquetFileFormat]] from each file's DV. Deleted rows are skipped by
  * [[DeltaBatchPartitionReader]] and the internal columns are dropped by the output projection.
  *
+ * The `_metadata` column (when present in `readSchema`, see `DeltaTableV2.metadataColumns`) is
+ * built by the output projection from:
+ *  - a per-file row of constant fields (`file_path`, `file_size`, `base_row_id`, ...), computed
+ *    with the file format's `fileConstantMetadataExtractors`, exactly like V1;
+ *  - the Parquet row index (`row_index`);
+ *  - the materialized Row ID / row commit version columns, combined with the per-file base values
+ *    the same way as the V1 `GenerateRowIDs` rule.
+ *
  * @param deletionVectorTablePath Table data path used to resolve DV files, or None when no
  *                                selected file has a Deletion Vector.
  * @param useMetadataRowIndex     Whether the row index used for DV filtering comes from the
@@ -364,10 +372,25 @@ class DeltaPartitionReaderFactory(
     useMetadataRowIndex: Boolean = true)
   extends PartitionReaderFactory {
 
+  import DeltaPartitionReaderFactory._
+
+  /** The requested `_metadata` struct, if any. A table column named `_metadata` takes priority. */
+  private val metadataStruct: Option[StructType] =
+    if (dataSchema.fieldNames.contains(FileFormat.METADATA_NAME)) {
+      None
+    } else {
+      readSchema.find(_.name == FileFormat.METADATA_NAME).map(_.dataType.asInstanceOf[StructType])
+    }
+
+  private val metadataFieldNames: Seq[String] = metadataStruct.toSeq.flatMap(_.fieldNames)
+
   // scalastyle:off caselocale
   private val readDataSchema: StructType = {
     val partitionNames = partitionSchema.fieldNames.map(_.toLowerCase(Locale.ROOT)).toSet
-    StructType(readSchema.filterNot(f => partitionNames.contains(f.name.toLowerCase(Locale.ROOT))))
+    StructType(readSchema.filterNot { f =>
+      partitionNames.contains(f.name.toLowerCase(Locale.ROOT)) ||
+        (metadataStruct.isDefined && f.name == FileFormat.METADATA_NAME)
+    })
   }
   // scalastyle:on caselocale
 
@@ -378,32 +401,122 @@ class DeltaPartitionReaderFactory(
    * Mirrors the extra scan output added by `PreprocessTableWithDVs` in V1.
    */
   private val deletionVectorColumns: Seq[StructField] = if (hasDeletionVectors) {
-    val rowIndexField = if (useMetadataRowIndex) {
-      // Filled by Spark's Parquet reader, which looks the column up by name. It must be nullable:
-      // the Parquet reader rejects non-nullable requested columns that are missing in the file.
-      Seq(StructField(ParquetFileFormat.ROW_INDEX_TEMPORARY_COLUMN_NAME, LongType,
-        nullable = true))
-    } else {
-      Seq.empty
-    }
+    val rowIndexField = if (useMetadataRowIndex) Seq(RowIndexField) else Seq.empty
     rowIndexField :+ DeltaParquetFileFormat.IS_ROW_DELETED_STRUCT_FIELD
   } else {
     Seq.empty
   }
 
+  /**
+   * Extra columns requested from the file reader to build `_metadata`: the Parquet row index
+   * (for `row_index` and `row_id`) unless already requested for DVs, and the materialized Row ID
+   * and row commit version columns. Like V1, the materialized columns are requested under their
+   * physical (materialized) name with the generated metadata field's Spark metadata, so that they
+   * are recognized as internal columns under column mapping. They are null for rows that don't
+   * have a materialized value.
+   */
+  private val metadataFileColumns: Seq[StructField] = {
+    val needsRowIndex = metadataFieldNames.exists(n => n == ParquetFileFormat.ROW_INDEX ||
+      n == RowId.ROW_ID)
+    val rowIndex =
+      if (needsRowIndex && !deletionVectorColumns.contains(RowIndexField)) Seq(RowIndexField)
+      else Seq.empty
+    rowIndex ++ materializedColumn(RowId.ROW_ID, MaterializedRowId) ++
+      materializedColumn(RowCommitVersion.METADATA_STRUCT_FIELD_NAME, MaterializedRowCommitVersion)
+  }
+
+  private def materializedColumn(
+      metadataFieldName: String,
+      column: MaterializedRowTrackingColumn): Option[StructField] = {
+    if (metadataFieldNames.contains(metadataFieldName)) {
+      for {
+        materializedName <- column.getMaterializedColumnName(protocol, metadata)
+        field <- parquetFormat.metadataSchemaFields.find(_.name == metadataFieldName)
+      } yield field.copy(name = materializedName, nullable = true)
+    } else {
+      None
+    }
+  }
+
   /** Schema requested from the file reader (without partition columns). */
-  private val fileRequiredSchema: StructType = StructType(readDataSchema ++ deletionVectorColumns)
+  private val fileRequiredSchema: StructType =
+    StructType(readDataSchema ++ deletionVectorColumns ++ metadataFileColumns)
 
   /** Schema of the rows produced by the file reader: `fileRequiredSchema ++ partitionSchema`. */
   private val fileOutputSchema: StructType = StructType(fileRequiredSchema ++ partitionSchema)
 
-  /** For each `readSchema` column, its ordinal in `fileOutputSchema`. Resolved on the driver. */
-  private val outputOrdinals: Array[Int] = {
+  /**
+   * Per-file constant `_metadata` fields to compute: the requested ones, plus the base values
+   * needed to derive `row_id` and `row_commit_version`.
+   */
+  private val constantMetadataFieldNames: Seq[String] = {
+    val generated = Set(ParquetFileFormat.ROW_INDEX, RowId.ROW_ID,
+      RowCommitVersion.METADATA_STRUCT_FIELD_NAME)
+    val helpers =
+      (if (metadataFieldNames.contains(RowId.ROW_ID)) Seq(RowId.BASE_ROW_ID) else Nil) ++
+        (if (metadataFieldNames.contains(RowCommitVersion.METADATA_STRUCT_FIELD_NAME)) {
+          Seq(DefaultRowCommitVersion.METADATA_STRUCT_FIELD_NAME)
+        } else {
+          Nil
+        })
+    (metadataFieldNames.filterNot(generated.contains) ++ helpers).distinct
+  }
+
+  /**
+   * Data types of `constantMetadataFieldNames`. The helper fields that are not requested
+   * (`base_row_id`, `default_row_commit_version`) are LONG.
+   */
+  private val constantMetadataFieldTypes: Seq[DataType] = constantMetadataFieldNames.map { name =>
+    metadataStruct.flatMap(_.find(_.name == name)).map(_.dataType).getOrElse(LongType)
+  }
+
+  /**
+   * Output expressions over `JoinedRow(fileRow, constantMetadataRow)`, producing `readSchema`.
+   * Built on the driver (resolving names needs the session conf) and compiled per task.
+   */
+  private val outputExpressions: Seq[Expression] = {
     val resolver = spark.sessionState.conf.resolver
-    readSchema.fieldNames.map { name =>
+    def fileRef(name: String): Expression = {
       val idx = fileOutputSchema.fieldNames.indexWhere(resolver(_, name))
       require(idx >= 0, s"Column $name not found in the file reader output")
-      idx
+      BoundReference(idx, fileOutputSchema(idx).dataType, nullable = true)
+    }
+    def constantRef(name: String): Expression = {
+      val idx = constantMetadataFieldNames.indexOf(name)
+      BoundReference(fileOutputSchema.length + idx, constantMetadataFieldTypes(idx),
+        nullable = true)
+    }
+    def materializedRef(column: MaterializedRowTrackingColumn): Option[Expression] =
+      column.getMaterializedColumnName(protocol, metadata)
+        .filter(n => metadataFileColumns.exists(_.name == n))
+        .map(fileRef)
+
+    def metadataFieldExpr(field: StructField): Expression = field.name match {
+      case ParquetFileFormat.ROW_INDEX =>
+        fileRef(ParquetFileFormat.ROW_INDEX_TEMPORARY_COLUMN_NAME)
+      case RowId.ROW_ID =>
+        // Same as GenerateRowIDs: coalesce(materialized row id, base_row_id + row_index).
+        val generated = Add(constantRef(RowId.BASE_ROW_ID),
+          fileRef(ParquetFileFormat.ROW_INDEX_TEMPORARY_COLUMN_NAME))
+        materializedRef(MaterializedRowId).map(m => Coalesce(Seq(m, generated)))
+          .getOrElse(generated)
+      case RowCommitVersion.METADATA_STRUCT_FIELD_NAME =>
+        // Same as GenerateRowIDs: coalesce(materialized version, default_row_commit_version).
+        val default = constantRef(DefaultRowCommitVersion.METADATA_STRUCT_FIELD_NAME)
+        materializedRef(MaterializedRowCommitVersion).map(m => Coalesce(Seq(m, default)))
+          .getOrElse(default)
+      case name =>
+        constantRef(name)
+    }
+
+    readSchema.map { f =>
+      if (metadataStruct.isDefined && f.name == FileFormat.METADATA_NAME) {
+        CreateNamedStruct(metadataStruct.get.flatMap { sub =>
+          Seq(Literal(sub.name), metadataFieldExpr(sub))
+        })
+      } else {
+        fileRef(f.name)
+      }
     }
   }
 
@@ -414,7 +527,7 @@ class DeltaPartitionReaderFactory(
     -1
   }
 
-  private val parquetFormat: DeltaParquetFileFormat = {
+  private lazy val parquetFormat: DeltaParquetFileFormat = {
     val format = new DeltaParquetFileFormat(protocol, metadata)
     deletionVectorTablePath match {
       case Some(tablePath) =>
@@ -427,13 +540,15 @@ class DeltaPartitionReaderFactory(
    * Filters passed to the Parquet reader. Like V1, only filters on data columns are passed:
    * partition columns are not read from the files, so Parquet would evaluate filters on them as
    * NULL. Partition filters are already applied through Delta log pruning and by Spark after the
-   * scan.
+   * scan. Filters on `_metadata` fields are not passed either; Spark applies them after the scan.
    */
   // scalastyle:off caselocale
   private val dataFilters: Seq[Filter] = {
     val partitionNames = partitionSchema.fieldNames.map(_.toLowerCase(Locale.ROOT)).toSet
+    def isMetadataRef(r: String): Boolean = metadataStruct.isDefined &&
+      (r == FileFormat.METADATA_NAME || r.startsWith(FileFormat.METADATA_NAME + "."))
     pushedFilters.toSeq.filterNot(_.references.exists(r =>
-      partitionNames.contains(r.toLowerCase(Locale.ROOT))))
+      partitionNames.contains(r.toLowerCase(Locale.ROOT)) || isMetadataRef(r)))
   }
   // scalastyle:on caselocale
 
@@ -449,15 +564,48 @@ class DeltaPartitionReaderFactory(
     hadoopConf = serializableHadoopConf.value
   )
 
+  /** Extractors for the constant `_metadata` fields, the same ones V1 uses. */
+  private val constantMetadataExtractors: Map[String, PartitionedFile => Any] =
+    parquetFormat.fileConstantMetadataExtractors
+
   override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
     val deltaPartition = partition.asInstanceOf[DeltaKeyGroupedInputPartition]
-    val outputExprs = outputOrdinals.toSeq.map { i =>
-      val f = fileOutputSchema(i)
-      BoundReference(i, f.dataType, f.nullable)
+    val projection = UnsafeProjection.create(outputExpressions)
+    val constantMetadata = if (constantMetadataFieldNames.nonEmpty) {
+      Some(ConstantMetadata(
+        constantMetadataFieldNames, constantMetadataFieldTypes, constantMetadataExtractors))
+    } else {
+      None
     }
-    val projection = UnsafeProjection.create(outputExprs)
-    new DeltaBatchPartitionReader(deltaPartition, readerBuilder, projection, isRowDeletedOrdinal)
+    new DeltaBatchPartitionReader(
+      deltaPartition, readerBuilder, projection, isRowDeletedOrdinal, constantMetadata)
   }
+}
+
+object DeltaPartitionReaderFactory {
+  /**
+   * The Parquet row index column, filled by Spark's Parquet reader, which looks the column up by
+   * name. It must be nullable: the Parquet reader rejects non-nullable requested columns that are
+   * missing in the file.
+   */
+  private val RowIndexField: StructField =
+    StructField(ParquetFileFormat.ROW_INDEX_TEMPORARY_COLUMN_NAME, LongType, nullable = true)
+}
+
+/**
+ * Computes the per-file row of constant `_metadata` field values.
+ *
+ * @param fieldNames     Names of the constant `_metadata` fields, in row order.
+ * @param fieldDataTypes Data types of the constant `_metadata` fields, in row order.
+ * @param extractors     The file format's `fileConstantMetadataExtractors`.
+ */
+case class ConstantMetadata(
+    fieldNames: Seq[String],
+    fieldDataTypes: Seq[DataType],
+    extractors: Map[String, PartitionedFile => Any]) {
+  def rowFor(file: PartitionedFile): InternalRow =
+    FileFormat.updateMetadataInternalRow(
+      new GenericInternalRow(fieldNames.length), fieldNames, file, extractors, fieldDataTypes)
 }
 
 /**
@@ -467,17 +615,22 @@ class DeltaPartitionReaderFactory(
  * @param isRowDeletedOrdinal Ordinal of the `is_row_deleted` column in the file reader rows, or
  *                            -1 when there are no Deletion Vectors. Rows whose value is not
  *                            [[RowIndexFilter.KEEP_ROW_VALUE]] are skipped.
+ * @param constantMetadata    Computes the per-file constant `_metadata` values, if `_metadata`
+ *                            needs any. The projection reads them after the file reader columns.
  */
 class DeltaBatchPartitionReader(
     partition: DeltaKeyGroupedInputPartition,
     readerBuilder: PartitionedFile => Iterator[InternalRow],
     projection: UnsafeProjection,
-    isRowDeletedOrdinal: Int = -1)
+    isRowDeletedOrdinal: Int = -1,
+    constantMetadata: Option[ConstantMetadata] = None)
   extends PartitionReader[InternalRow] {
 
   private val fileIterator: Iterator[DeltaScanFileInfo] = partition.files.iterator
   private var currentFileReader: Option[Iterator[InternalRow]] = None
   private var currentRow: InternalRow = _
+  private val joinedRow = new JoinedRow()
+  private var constantMetadataRow: InternalRow = InternalRow.empty
 
   private def closeCurrentFileReader(): Unit = {
     currentFileReader.foreach {
@@ -497,8 +650,12 @@ class DeltaBatchPartitionReader(
         filePath = SparkPath.fromPathString(fileInfo.path),
         start = 0,
         length = fileInfo.size,
+        modificationTime = fileInfo.modificationTime,
+        fileSize = fileInfo.size,
         otherConstantMetadataColumnValues = fileInfo.constantMetadata
       )
+      constantMetadataRow =
+        constantMetadata.map(_.rowFor(partitionedFile)).getOrElse(InternalRow.empty)
       currentFileReader = Some(readerBuilder(partitionedFile))
     }
     currentFileReader.exists(_.hasNext)
@@ -512,7 +669,7 @@ class DeltaBatchPartitionReader(
     while (!found && advanceToNextFile()) {
       val row = currentFileReader.get.next()
       if (!isRowDeleted(row)) {
-        currentRow = projection(row)
+        currentRow = projection(joinedRow(row, constantMetadataRow))
         found = true
       }
     }

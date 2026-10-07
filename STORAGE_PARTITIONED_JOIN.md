@@ -22,6 +22,7 @@ can understand the change without reading the diff side by side.
    - [6.3 `DeltaTableV2.scala`: `SupportsRead`](#63-deltatablev2scala-supportsread)
    - [6.4 `v2/DeltaScanBuilder.scala`: the V2 scan](#64-v2deltascanbuilderscala-the-v2-scan)
    - [6.5 Deletion Vector support](#65-deletion-vector-support)
+   - [6.6 `_metadata` column support](#66-_metadata-column-support)
 7. [Design Details & Invariants](#7-design-details--invariants)
 8. [Behavior Matrix](#8-behavior-matrix)
 9. [Limitations](#9-limitations)
@@ -51,7 +52,9 @@ removes the shuffle for aggregations grouped by the partition columns.
 
 This change adds an **opt-in** DataSource V2 read path for partitioned Delta tables that supports
 SPJ. Tables with **Deletion Vectors** are supported: the V2 reader filters deleted rows the same
-way the V1 reader does (6.5).
+way the V1 reader does (6.5). The **`_metadata` column** (file metadata, `row_index`, and the row
+tracking fields `row_id` / `row_commit_version`) is supported too, with the same values as V1
+(6.6).
 
 ---
 
@@ -96,15 +99,19 @@ have to sort its partitions.
 
 | File | Change | Lines |
 | :--- | :--- | :--- |
-| `spark/src/main/scala/org/apache/spark/sql/delta/sources/DeltaSQLConf.scala` | New confs `storagePartitionedJoin.enabled` and (internal) `storagePartitionedJoin.deletionVectors.enabled` | +18 |
-| `spark/src/main/scala/org/apache/spark/sql/delta/FallbackToV1Relations.scala` | Keep V2 relation when the table qualifies | +36 / -1 |
-| `spark/src/main/scala/org/apache/spark/sql/delta/catalog/DeltaTableV2.scala` | `with SupportsRead`, `newScanBuilder` | +8 / -1 |
+| `spark/src/main/scala/org/apache/spark/sql/delta/sources/DeltaSQLConf.scala` | New confs `storagePartitionedJoin.enabled` and (internal) `storagePartitionedJoin.deletionVectors.enabled` | +17 |
+| `spark/src/main/scala/org/apache/spark/sql/delta/FallbackToV1Relations.scala` | Keep V2 relation when the table qualifies; table-level check shared with `DeltaTableV2.metadataColumns` | +43 / -2 |
+| `spark/src/main/scala/org/apache/spark/sql/delta/catalog/DeltaTableV2.scala` | `with SupportsRead`, `newScanBuilder`; `with SupportsMetadataColumns`, `metadataColumns` (6.6.1) | +30 / -2 |
+| `spark/src/main/scala/org/apache/spark/sql/delta/DeltaAnalysis.scala` | V2 → V1 conversion keeps `_metadata` references valid (6.6.5) | +93 / -7 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/files/TahoeFileIndex.scala` | Per-file constant metadata (row tracking, DV descriptor) moved into a reusable `TahoeFileIndex.constantMetadataForFile` | +30 / -17 |
-| `spark/src/main/scala/org/apache/spark/sql/delta/v2/DeltaScanBuilder.scala` | **New.** Scan builder, scan (with statistics), input partition, reader factory, reader (with DV filtering) | ~530 |
-| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 34 tests | ~790 |
+| `spark/src/main/scala/org/apache/spark/sql/delta/v2/DeltaScanBuilder.scala` | **New.** Scan builder, scan (with statistics), input partition, reader factory (with `_metadata`), reader (with DV filtering) | ~690 |
+| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 47 tests | ~980 |
 
 No other code paths change when the conf is `false`. The only extra work is two conf lookups per
-Delta relation during analysis.
+Delta relation during analysis (plus two more when Spark asks a Delta table for its metadata
+columns). DELETE and UPDATE now convert their target with
+`DeltaRelation.toV1WithMetadataReferences` (6.6.5), which does the same conversion as before and
+rewrites nothing unless the V2 relation exposes `_metadata`, which needs the conf.
 
 ---
 
@@ -137,7 +144,7 @@ sequenceDiagram
         Planner->>Planner: Both sides key-grouped on region:<br/>no ShuffleExchangeExec
         Planner->>Scan: createReaderFactory()
         Scan-->>Exec: DeltaPartitionReaderFactory (driver builds Parquet reader fn)
-        Exec->>Exec: per task: read each file in the group,<br/>skip rows deleted by DVs,<br/>add partition values, project to readSchema
+        Exec->>Exec: per task: read each file in the group,<br/>skip rows deleted by DVs,<br/>add partition values and _metadata, project to readSchema
     else Not eligible
         Analysis-->>TableV2: replace with V1 LogicalRelation (unchanged behavior)
     end
@@ -155,8 +162,7 @@ val DELTA_STORAGE_PARTITIONED_JOIN_ENABLED =
     .doc("When true, reads of partitioned Delta tables use a DataSource V2 scan that reports " +
       "the table's partitioning to Spark, enabling Storage-Partitioned Join (SPJ) to avoid " +
       "shuffles when join/grouping keys match the table's partition columns. Requires " +
-      "spark.sql.sources.v2.bucketing.enabled=true. CDC reads always use the V1 scan. The " +
-      "_metadata column is not supported when the V2 scan is used.")
+      "spark.sql.sources.v2.bucketing.enabled=true. CDC reads always use the V1 scan.")
     .booleanConf
     .createWithDefault(false)
 
@@ -209,10 +215,14 @@ object FallbackToV1DeltaRelation {
   }
 
   private def shouldKeepAsV2ForSPJ(d: DeltaTableV2, dsv2: DataSourceV2Relation): Boolean = {
+    !CDCReader.isCDCRead(dsv2.options) && isTableEligibleForV2Read(d)                  // (5)
+  }
+
+  // Also used by DeltaTableV2.metadataColumns (6.6.1)
+  private[delta] def isTableEligibleForV2Read(d: DeltaTableV2): Boolean = {
     val conf = d.spark.sessionState.conf
     val enabled = conf.getConf(DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_ENABLED) &&  // (3)
-      conf.getConf(SQLConf.V2_BUCKETING_ENABLED) &&                                    // (4)
-      !CDCReader.isCDCRead(dsv2.options)                                               // (5)
+      conf.getConf(SQLConf.V2_BUCKETING_ENABLED)                                       // (4)
     enabled && {
       val snapshot = d.initialSnapshot                                                 // (6)
       snapshot.metadata.partitionColumns.nonEmpty &&                                   // (7)
@@ -234,7 +244,10 @@ doesn't match, so the `DataSourceV2Relation` stays in the plan.
 4. **Spark's SPJ switch.** If Spark won't use the reported partitioning, the V2 scan has no
    benefit and only adds risk, so the read stays on V1.
 5. **CDC reads** (`readChangeFeed=true`) need V1's CDC handling in `DeltaRelation.fromV2Relation`.
-6. **The snapshot is loaded only if 3–5 pass.** `initialSnapshot` is a lazy val that may read the
+   This is the only check that depends on the read options, so it lives in
+   `shouldKeepAsV2ForSPJ`. The table-level checks 3, 4, 6–8 are in `isTableEligibleForV2Read`,
+   which `DeltaTableV2.metadataColumns` (6.6.1) calls too: a table has no read options there.
+6. **The snapshot is loaded only if 3–4 pass.** `initialSnapshot` is a lazy val that may read the
    Delta log, so it isn't touched when the feature is off.
 7. **Unpartitioned tables** have nothing to report, so they stay on V1.
 8. **Deletion Vectors:** the V2 reader filters deleted rows (6.5), so DV tables stay V2 by
@@ -247,7 +260,8 @@ doesn't match, so the `DataSourceV2Relation` stays in the plan.
   existing handling.
 - DML (`DeleteFromTable`, `UpdateTable`, `MergeIntoTable`) converts its *target* to V1 through
   the separate `DeltaRelation` extractor, which ignores this flag. A partitioned Delta table used
-  as a MERGE source or in `INSERT ... SELECT` may be read through the V2 scan.
+  as a MERGE source or in `INSERT ... SELECT` may be read through the V2 scan. (DELETE and UPDATE
+  additionally fix up `_metadata` references during that conversion, see 6.6.5.)
 
 ### 6.3 `DeltaTableV2.scala`: `SupportsRead`
 
@@ -271,6 +285,7 @@ override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
   with `timeTravelOpt` set.
 - `tableSchema` is the user-facing logical schema (column-mapping logical names, internal metadata
   removed). It is the full schema before pruning.
+- `DeltaTableV2` also implements `SupportsMetadataColumns` now; see 6.6.1.
 
 ### 6.4 `v2/DeltaScanBuilder.scala`: the V2 scan
 
@@ -520,8 +535,11 @@ case class DeltaKeyGroupedInputPartition(partitionId: Int, files: Array[DeltaSca
 
 #### 6.4.8 `DeltaPartitionReaderFactory`: building the Parquet reader
 
-The snippet below shows the reader for a table without Deletion Vectors. The extra DV parameters
-(`deletionVectorTablePath`, `useMetadataRowIndex`) and the columns they add are covered in 6.5.2.
+The snippet below shows the reader for a table without Deletion Vectors and a query that doesn't
+read `_metadata`. The extra DV parameters (`deletionVectorTablePath`, `useMetadataRowIndex`) and
+the columns they add are covered in 6.5.2. For `_metadata`, the column-reordering
+`outputOrdinals` below is generalized into output *expressions* (6.6.3); without `_metadata` they
+are the same `BoundReference`s.
 
 ```scala
 class DeltaPartitionReaderFactory(spark, dataSchema, partitionSchema, readSchema,
@@ -703,7 +721,7 @@ FileStatusWithMetadata(fs, TahoeFileIndex.constantMetadataForFile(addFile, rowIn
 - The V2 scan passes `rowIndexFilters = None`, so files with a DV get `IF_CONTAINED` ("drop rows
   in the bitmap"). Non-default filter types are only used by CDC reads, which stay on V1.
 - The row tracking entries (`base_row_id`, `default_row_commit_version`) are carried along too.
-  They are unused by the V2 scan today.
+  The `_metadata` support (6.6) reads them.
 
 #### 6.5.2 `DeltaPartitionReaderFactory`: DV-aware file reader
 
@@ -764,8 +782,8 @@ private val readerBuilder = parquetFormat.buildReaderWithPartitionValues(
   `false`, `DeltaParquetFileFormat` counts rows itself. The row index field must be **nullable**:
   Spark's vectorized Parquet reader rejects a non-nullable requested column that is missing from
   the file ("Required column is missing in data file") before it gets to fill in the row index.
-- **(b)** `outputOrdinals` is computed over this wider `fileOutputSchema`, but only for
-  `readSchema` columns. So the output projection naturally drops the internal columns.
+- **(b)** The output projection (6.4.8 / 6.6.3) is built over this wider `fileOutputSchema`, but
+  only references `readSchema` columns. So it naturally drops the internal columns.
 - **(d)** `copyWithDVInfo` sets `tablePath` (used to resolve DV files stored next to the table) and
   `optimizationsEnabled`. `DeltaParquetFileFormat` requires `optimizationsEnabled ==
   useMetadataRowIndex` when a table path is set. With `optimizationsEnabled=false`, it also stops
@@ -790,6 +808,311 @@ private val readerBuilder = parquetFormat.buildReaderWithPartitionValues(
 when `storagePartitionedJoin.deletionVectors.enabled=false`. That makes it possible to turn off
 just the DV path in production without turning off SPJ.
 
+### 6.6 `_metadata` column support
+
+Spark file sources expose a hidden `_metadata` struct column. For Delta (`DeltaParquetFileFormat`)
+it has these fields:
+
+| Field | Kind | Value |
+| :--- | :--- | :--- |
+| `file_path`, `file_name`, `file_size`, `file_block_start`, `file_block_length`, `file_modification_time` | constant per file | from the `PartitionedFile` (Spark's `FileFormat.BASE_METADATA_EXTRACTORS`) |
+| `row_index` | per row | Parquet row position, filled by Spark's Parquet reader into `_tmp_metadata_row_index` |
+| `base_row_id`, `default_row_commit_version` | constant per file (row tracking only) | from `AddFile`, via `otherConstantMetadataColumnValues` (6.5.1) |
+| `row_id` | per row (row tracking only) | `coalesce(materialized row ID column, base_row_id + row_index)` |
+| `row_commit_version` | per row (row tracking only) | `coalesce(materialized commit version column, default_row_commit_version)` |
+
+V1 gets all of this from `FileSourceScanExec`, the file format, and the V1-only rule
+`GenerateRowIDs` (for `row_id` / `row_commit_version`). Before this change, with the feature on,
+queries reading `_metadata` from an eligible table failed analysis, because `DeltaTableV2` didn't
+expose any metadata column. Now the V2 scan produces the same values. The flow is:
+
+1. `DeltaTableV2.metadataColumns` exposes `_metadata` (6.6.1), so Spark resolves it on the V2
+   relation and asks the scan for it through `pruneColumns` (`readSchema` gets a `_metadata`
+   field, pruned to the fields the query uses).
+2. The reader factory requests the extra per-row columns from the file reader (6.6.2) and builds
+   the struct with output expressions (6.6.3).
+3. The partition reader computes the constant fields once per file (6.6.4).
+4. If a relation that resolved `_metadata` is converted to V1 anyway (DML), the references are
+   fixed up (6.6.5).
+
+#### 6.6.1 `DeltaTableV2.scala`: `SupportsMetadataColumns`
+
+```scala
+class DeltaTableV2 private(...)
+  extends Table
+  with SupportsRead
+  with SupportsMetadataColumns   // new
+  ...
+
+override def metadataColumns(): Array[MetadataColumn] = {
+  if (tableExists && FallbackToV1DeltaRelation.isTableEligibleForV2Read(this)) {   // (a)
+    val metadataType = DeltaParquetFileFormat(initialSnapshot.protocol, initialSnapshot.metadata)
+      .createFileMetadataCol().dataType                                             // (b)
+    Array(new MetadataColumn {
+      override def name(): String = FileFormat.METADATA_NAME                        // "_metadata"
+      override def dataType(): DataType = metadataType
+      override def isNullable(): Boolean = false
+    })
+  } else {
+    Array.empty
+  }
+}
+```
+
+- **(a) Only for relations that stay V2.** Spark resolves `_metadata` against the V2 relation's
+  `metadataOutput` *before* `DeltaAnalysis` replaces the relation with V1. If every Delta table
+  exposed the column, a relation that then falls back to V1 would carry a V2 metadata attribute
+  that the V1 scan doesn't produce. With an empty array, the V1 `LogicalRelation` resolves
+  `_metadata` itself, exactly as before. CDC reads can't be detected here (no read options), so a
+  CDC read of an eligible table sees the column; it falls back to V1 and is handled by
+  6.6.5 / `fromV2Relation`. V1 CDC relations don't support `_metadata` either.
+- **(b) Same type as V1.** The struct type comes from the same `DeltaParquetFileFormat` method V1
+  uses, so it includes the row tracking fields exactly when V1 does, with the same field metadata.
+- A table column named `_metadata` hides the metadata column (Spark's normal rule); the reader
+  factory then treats `_metadata` as a data column (6.6.2).
+
+#### 6.6.2 `DeltaPartitionReaderFactory`: extra file reader columns
+
+```scala
+// The requested `_metadata` struct, if any. A table column named `_metadata` takes priority.
+private val metadataStruct: Option[StructType] =
+  if (dataSchema.fieldNames.contains(FileFormat.METADATA_NAME)) None
+  else readSchema.find(_.name == FileFormat.METADATA_NAME).map(_.dataType.asInstanceOf[StructType])
+private val metadataFieldNames = metadataStruct.toSeq.flatMap(_.fieldNames)
+
+// Data columns only: no partition columns and no `_metadata`
+private val readDataSchema = StructType(readSchema.filterNot { f =>
+  partitionNames.contains(f.name.toLowerCase(ROOT)) ||
+    (metadataStruct.isDefined && f.name == FileFormat.METADATA_NAME)
+})
+
+// (a) Extra per-row columns for `_metadata`
+private val metadataFileColumns: Seq[StructField] = {
+  val needsRowIndex = metadataFieldNames.exists(n => n == ROW_INDEX || n == RowId.ROW_ID)
+  val rowIndex =
+    if (needsRowIndex && !deletionVectorColumns.contains(RowIndexField)) Seq(RowIndexField)
+    else Seq.empty
+  rowIndex ++ materializedColumn(RowId.ROW_ID, MaterializedRowId) ++
+    materializedColumn(RowCommitVersion.METADATA_STRUCT_FIELD_NAME, MaterializedRowCommitVersion)
+}
+
+// (b) Materialized row tracking column, under its physical name
+private def materializedColumn(metadataFieldName, column): Option[StructField] =
+  if (metadataFieldNames.contains(metadataFieldName)) {
+    for {
+      materializedName <- column.getMaterializedColumnName(protocol, metadata)
+      field <- parquetFormat.metadataSchemaFields.find(_.name == metadataFieldName)
+    } yield field.copy(name = materializedName, nullable = true)
+  } else None
+
+private val fileRequiredSchema =
+  StructType(readDataSchema ++ deletionVectorColumns ++ metadataFileColumns)
+
+// (c) Constant fields: the requested ones, plus the bases for row_id / row_commit_version
+private val constantMetadataFieldNames: Seq[String] = {
+  val generated = Set(ROW_INDEX, RowId.ROW_ID, RowCommitVersion.METADATA_STRUCT_FIELD_NAME)
+  val helpers =
+    (if (metadataFieldNames.contains(RowId.ROW_ID)) Seq(RowId.BASE_ROW_ID) else Nil) ++
+    (if (metadataFieldNames.contains(RowCommitVersion.METADATA_STRUCT_FIELD_NAME))
+      Seq(DefaultRowCommitVersion.METADATA_STRUCT_FIELD_NAME) else Nil)
+  (metadataFieldNames.filterNot(generated.contains) ++ helpers).distinct
+}
+private val constantMetadataFieldTypes: Seq[DataType] = constantMetadataFieldNames.map { name =>
+  metadataStruct.flatMap(_.find(_.name == name)).map(_.dataType).getOrElse(LongType)
+}
+```
+
+- **Only what the query uses.** Spark's nested column pruning passes a `_metadata` struct with
+  just the referenced fields, so `SELECT _metadata.file_name` adds no per-row column at all.
+- **(a) Row index.** `row_index` and `row_id` need the Parquet row position. It is the same
+  nullable `_tmp_metadata_row_index` field the DV path uses (6.5.2 a), requested once even when
+  both need it. Spark's Parquet reader fills it in both the vectorized and the row-based reader,
+  independently of `useMetadataRowIndex`.
+- **(b) Materialized row tracking columns.** After UPDATE/MERGE rewrites rows, their original row
+  IDs and commit versions are stored in hidden Parquet columns with generated names (table
+  properties `delta.rowTracking.materializedRowIdColumnName` / `...RowCommitVersionColumnName`).
+  They are requested like V1 does: with the physical name and the Spark metadata of the generated
+  `_metadata` field, so `DeltaParquetFileFormat` treats them as internal columns under column
+  mapping instead of trying to map them to table columns. They are nullable: rows never rewritten
+  have no value, and files written before row tracking was enabled don't have the column.
+- **(c) Constant fields** become a separate per-file row (6.6.4). Their types come from the
+  requested struct; the helper bases that weren't requested are LONG.
+- `parquetFormat` is a `lazy val` now, because `materializedColumn` reads its
+  `metadataSchemaFields` while the factory is still being initialized.
+- **Filters:** pushed filters that reference `_metadata` are not given to Parquet (it would see a
+  column that isn't in the file). Spark applies them after the scan, as with every filter here.
+
+#### 6.6.3 Output expressions
+
+The file reader returns `readDataSchema ++ deletionVectorColumns ++ metadataFileColumns ++
+partitionSchema`. The constant fields are appended with a `JoinedRow`, so the projection input is
+`fileRow ++ constantMetadataRow`. The output projection is built from expressions:
+
+```scala
+private val outputExpressions: Seq[Expression] = {
+  def fileRef(name: String) = BoundReference(indexIn(fileOutputSchema, name), type, nullable = true)
+  def constantRef(name: String) = BoundReference(
+    fileOutputSchema.length + constantMetadataFieldNames.indexOf(name), typeOf(name), true)
+
+  def metadataFieldExpr(field: StructField): Expression = field.name match {
+    case ROW_INDEX => fileRef(ROW_INDEX_TEMPORARY_COLUMN_NAME)
+    case RowId.ROW_ID =>                                        // as GenerateRowIDs
+      val generated = Add(constantRef(BASE_ROW_ID), fileRef(ROW_INDEX_TEMPORARY_COLUMN_NAME))
+      materializedRef(MaterializedRowId).map(m => Coalesce(Seq(m, generated))).getOrElse(generated)
+    case RowCommitVersion.METADATA_STRUCT_FIELD_NAME =>         // as GenerateRowIDs
+      val default = constantRef(DEFAULT_ROW_COMMIT_VERSION)
+      materializedRef(MaterializedRowCommitVersion).map(m => Coalesce(Seq(m, default)))
+        .getOrElse(default)
+    case name => constantRef(name)
+  }
+
+  readSchema.map { f =>
+    if (metadataStruct.isDefined && f.name == METADATA_NAME) {
+      CreateNamedStruct(metadataStruct.get.flatMap(sub => Seq(Literal(sub.name), metadataFieldExpr(sub))))
+    } else {
+      fileRef(f.name)
+    }
+  }
+}
+```
+
+- Without `_metadata`, the expressions are just `BoundReference`s, i.e. the same reordering
+  projection as 6.4.8.
+- The struct is built with the fields in the order of the requested (pruned) struct, which is
+  what Spark expects for the scan output.
+- `row_id` / `row_commit_version` use the same `coalesce` as V1's `GenerateRowIDs`. Rows that
+  were never rewritten get `base_row_id + row_index`; rewritten rows keep their materialized
+  value. With DVs, deleted rows are dropped before the projection, but `row_index` is the
+  physical position, so the IDs of the remaining rows are unaffected (as in V1).
+- The expressions are built on the driver (name resolution needs the session conf) and compiled
+  into an `UnsafeProjection` per task in `createReader`.
+
+#### 6.6.4 Per-file constant values
+
+```scala
+case class ConstantMetadata(
+    fieldNames: Seq[String],
+    fieldDataTypes: Seq[DataType],
+    extractors: Map[String, PartitionedFile => Any]) {
+  def rowFor(file: PartitionedFile): InternalRow =
+    FileFormat.updateMetadataInternalRow(
+      new GenericInternalRow(fieldNames.length), fieldNames, file, extractors, fieldDataTypes)
+}
+
+// in DeltaBatchPartitionReader.advanceToNextFile
+val partitionedFile = PartitionedFile(
+  partitionValues = fileInfo.partitionValues,
+  filePath = SparkPath.fromPathString(fileInfo.path),
+  start = 0, length = fileInfo.size,
+  modificationTime = fileInfo.modificationTime,          // new: file_modification_time
+  fileSize = fileInfo.size,                              // new: file_size
+  otherConstantMetadataColumnValues = fileInfo.constantMetadata)
+constantMetadataRow = constantMetadata.map(_.rowFor(partitionedFile)).getOrElse(InternalRow.empty)
+
+// in next()
+currentRow = projection(joinedRow(row, constantMetadataRow))
+```
+
+- **Same code as V1.** `extractors` is `parquetFormat.fileConstantMetadataExtractors`: Spark's
+  base extractors (`file_path`, `file_name`, ...) plus Delta's (`base_row_id`,
+  `default_row_commit_version`, read from `otherConstantMetadataColumnValues`).
+  `FileFormat.updateMetadataInternalRow` is the helper Spark's own file scan uses to fill the
+  constant metadata row. So values such as `file_path` (a URI string) and
+  `file_modification_time` (a timestamp in microseconds) are formatted exactly like V1.
+- `PartitionedFile` now also gets the modification time and the file size, which the extractors
+  read. Files are read whole, so `file_block_start = 0` and `file_block_length = file_size`,
+  which is also what V1 reports for unsplit files.
+- The constant row is computed once per file, not per row. `JoinedRow` avoids copying the file
+  row.
+
+#### 6.6.5 `DeltaAnalysis.scala`: keeping `_metadata` references valid when converting to V1
+
+Some relations that resolved `_metadata` on the V2 relation are converted to V1 afterwards. Two
+places handle this.
+
+**(a) `DeltaRelation.fromV2Relation`**: when the V2 relation's *output* already contains the
+V2 `_metadata` attribute, it is replaced by the V1 file-source metadata attribute with the same
+expression ID:
+
+```scala
+} else {
+  v2Relation.output.map(toV1FileMetadataAttribute(relation, _))   // was: v2Relation.output
+}
+
+private def toV1FileMetadataAttribute(relation: BaseRelation, attr: AttributeReference) =
+  (relation, attr) match {
+    case (fsRelation: HadoopFsRelation, MetadataAttribute(metadataAttr))
+        if metadataAttr.name == FileFormat.METADATA_NAME &&
+          !FileSourceMetadataAttribute.isValid(metadataAttr.metadata) =>
+      val v1Attr = fsRelation.fileFormat.createFileMetadataCol()
+      if (v1Attr.dataType == metadataAttr.dataType) {
+        v1Attr.withExprId(metadataAttr.exprId).withQualifier(metadataAttr.qualifier)
+      } else attr
+    case _ => attr
+  }
+```
+
+References above the relation keep pointing at the same expression ID, and the V1 scan
+recognizes the attribute as a file-source metadata column and fills it in. This is defensive:
+the common DML case is (b).
+
+**(b) DELETE and UPDATE**: `DeltaAnalysis` converts their target to V1 as soon as the command's
+children are resolved. At that point the condition may already reference the V2 relation's
+`_metadata` (resolved from `metadataOutput`), but Spark hasn't yet added the column to the V2
+relation's output. The V1 relation then has a *different* `_metadata` attribute in its own
+`metadataOutput`, so the reference dangles and analysis fails with an internal
+`MISSING_ATTRIBUTES.RESOLVED_ATTRIBUTE_MISSING_FROM_INPUT` error. The new helper converts the
+target and remaps those references:
+
+```scala
+case d @ DeleteFromTable(table, condition) if d.childrenResolved =>
+  val (newTarget, rewriteMetadataRefs) =
+    DeltaRelation.toV1WithMetadataReferences(stripTempViewWrapper(table))
+  ...
+  DeltaDelete(newTarget, Some(condition.transform(rewriteMetadataRefs)))
+
+case u @ UpdateTable(table, assignments, condition) if u.childrenResolved =>
+  val (newTable, rewriteMetadataRefs) =
+    DeltaRelation.toV1WithMetadataReferences(stripTempViewWrapper(table))
+  val (cols, expressions) = assignments.map { a =>
+    a.key.transform(rewriteMetadataRefs) -> a.value.transform(rewriteMetadataRefs)
+  }.unzip
+  ...
+  DeltaUpdateTable(newTable, cols, expressions, condition.map(_.transform(rewriteMetadataRefs)))
+
+// object DeltaRelation
+def toV1WithMetadataReferences(plan: LogicalPlan)
+    : (LogicalPlan, PartialFunction[Expression, Expression]) = {
+  var metadataAttrs = Map.empty[ExprId, AttributeReference]
+  val newPlan = plan.transformUp {
+    case relation @ DeltaRelation(lr) =>               // same conversion as before
+      relation match {
+        case v2Relation: DataSourceV2Relation =>
+          metadataAttrs ++= v1MetadataAttributeFor(v2Relation, lr)
+        case _ =>
+      }
+      lr
+  }
+  (newPlan, { case a: AttributeReference if metadataAttrs.contains(a.exprId) =>
+    metadataAttrs(a.exprId) })
+}
+
+// V2 `_metadata` in metadataOutput -> V1 `_metadata` in lr.metadataOutput (same type), unless
+// lr already outputs a `_metadata` column (a table column, or already handled by (a))
+private def v1MetadataAttributeFor(v2Relation, lr): Option[(ExprId, AttributeReference)]
+```
+
+- After the remap, the condition references the V1 relation's own metadata attribute, so Spark's
+  `AddMetadataColumns` adds `_metadata` to the V1 relation as it does for V1 reads, and the
+  command behaves exactly as with the feature off.
+- **V1 itself doesn't support these statements.** UPDATE / DELETE that filter on the target's
+  `_metadata` fail in V1 (`DELTA_CANNOT_RESOLVE_COLUMN` when writing, or `AMBIGUOUS_REFERENCE`
+  with DVs), and so does MERGE (`DELTA_MERGE_RESOLVED_ATTRIBUTE_MISSING_FROM_INPUT`). The goal
+  here is only to get the *same* outcome instead of an internal error. MERGE already fails the
+  same way without a remap, so its conversion is unchanged.
+- With the feature off, V2 relations expose no metadata column (6.6.1), so the map is empty and
+  the conversion is the same as before.
+
 ---
 
 ## 7. Design Details & Invariants
@@ -811,7 +1134,8 @@ Take a table partitioned by `(region, state)` and a query that joins only on `re
 | :--- | :--- | :--- |
 | `DeltaKeyGroupedInputPartition.partitionKey()` | projected partition columns | `BatchScanExec`: must match the `KeyGroupedPartitioning` expressions |
 | `DeltaScanFileInfo.partitionValues` / `PartitionedFile.partitionValues` | all partition columns | `ParquetFileFormat`: must match `partitionSchema` |
-| Reader output before projection | `readDataSchema ++ [row index] ++ [is_row_deleted] ++ partitionSchema` (DV columns only when DVs are present, 6.5.2) | produced by `buildReaderWithPartitionValues` |
+| Reader output before projection | `readDataSchema ++ [row index] ++ [is_row_deleted] ++ [materialized row tracking columns] ++ partitionSchema` (DV columns only when DVs are present, 6.5.2; `_metadata` columns only when requested, 6.6.2) | produced by `buildReaderWithPartitionValues` |
+| Constant `_metadata` row | requested constant `_metadata` fields (+ row tracking bases) | appended with `JoinedRow` before the projection (6.6.4) |
 | Row returned by `get()` | `readSchema` | `BatchScanExec` output attributes |
 
 ### 7.3 Column mapping
@@ -825,7 +1149,8 @@ Parquet files use physical names. Physical names are used only when looking up
 
 Partition parsing (`Cast` with the session time zone), file path resolution, and file pruning
 (`filesForScan`) all reuse the logic the V1 path uses. The Timestamp test compares V2 output with
-V1 output directly.
+V1 output directly. `_metadata` values come from the same type definition, extractors and
+row tracking formula as V1 (6.6), and every `_metadata` test compares V2 output with V1 output.
 
 ### 7.5 Deletion Vectors and CDC
 
@@ -844,11 +1169,12 @@ V1 output directly.
 | :--- | :--- | :--- |
 | Delta conf off (default) | V1 `FileSourceScanExec` | No |
 | Delta conf on, `v2.bucketing.enabled=false` | V1 | No |
-| Unpartitioned table | V1 | No |
+| Unpartitioned table | V1 (`_metadata` resolved by V1 as before) | No |
 | Partitioned table with Deletion Vectors | V2, deleted rows filtered (6.5) | **Yes** |
 | Table with Deletion Vectors, `storagePartitionedJoin.deletionVectors.enabled=false` | V1 | No |
+| Query reads `_metadata` (any field, incl. row tracking) | V2, `_metadata` built by the reader (6.6) | **Yes** |
 | CDC read (`readChangeFeed`) | V1 | No |
-| DML target (UPDATE/DELETE/MERGE) | V1 (existing `DeltaRelation` handling) | No |
+| DML target (UPDATE/DELETE/MERGE) | V1 (existing `DeltaRelation` handling; `_metadata` references remapped, 6.6.5) | No |
 | Partitioned table, query reads no partition column | V2, `UnknownPartitioning`, one split per file | No |
 | Partitioned table, both join sides key-grouped on compatible keys | V2, `KeyGroupedPartitioning` | **Yes** |
 | One side V2 key-grouped, other side V1 or incompatible | V2 + V1 | No (Spark shuffles) |
@@ -857,8 +1183,8 @@ V1 output directly.
 
 ## 9. Limitations
 
-- **`_metadata` column:** `DeltaTableV2` doesn't implement `SupportsMetadataColumns`. With the
-  feature on, queries that reference `_metadata` on an eligible table fail analysis.
+- **DML filtering on the target's `_metadata`:** not supported, as in V1; the same error is
+  raised with the feature on (6.6.5).
 - **No file splitting / packing:** each key group is one task, files are read whole, and with
   `UnknownPartitioning` there is one task per file (no packing of small files like V1's
   `maxPartitionBytes`). Skewed or very large partitions get less parallelism.
@@ -878,7 +1204,7 @@ V1 output directly.
 
 ## 10. Test Suite
 
-`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 34
+`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 47
 tests.
 
 **Setup (`withSPJConf`):** turns on both SPJ confs, `pushPartValues=true`,
@@ -931,8 +1257,20 @@ deterministic.
 | 30 | SPJ on Deletion Vector enabled table without any DV | DV feature on but no DVs (`hasDeletionVectors=false`). |
 | 31 | SPJ on Deletion Vector tables with column mapping | DV + renamed column. |
 | 32 | Deletion Vector tables fall back to V1 when DV support is disabled | Kill switch (6.5.4). |
-| 33 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
-| 34 | SPJ with tables containing NULL partition values | NULL keys. |
+| 33 | `_metadata` file fields read through the V2 scan match V1 | Each file field, the whole struct, `GROUP BY _metadata.file_name`, `_metadata` only (no data column), a filter on `_metadata.file_name`, and the DataFrame API (6.6.2–6.6.4). |
+| 34 | A table column named _metadata hides the metadata column in the V2 scan | User column wins (6.6.1, 6.6.2). |
+| 35 | SPJ join selecting _metadata columns avoids shuffle | `_metadata` from both sides of a shuffle-free join. |
+| 36–37 | `_metadata.row_index` on a Deletion Vector table (`useMetadataRowIndex` true / false) | Row index shared with DV filtering; exact physical positions of the remaining rows. |
+| 38–41 | Row tracking `_metadata` fields read through the V2 scan match V1 (column mapping `none` / `name` × DVs off / on) | `row_id`, `row_commit_version`, `base_row_id`, `default_row_commit_version`, `row_index` before and after UPDATE + DELETE (materialized columns, 6.6.2 b, 6.6.3); row IDs unique. |
+| 42 | `_metadata` on an unpartitioned table with SPJ enabled still uses V1 | No metadata column exposed for tables that fall back (6.6.1 a). |
+| 43 | Change data feed reads work with SPJ enabled | `readChangeFeed` option and `table_changes` still use V1. |
+| 44–45 | DML filtering on _metadata behaves the same with SPJ enabled as with V1 (DVs off / on) | UPDATE / DELETE / MERGE with a `_metadata` condition give the same outcome (error condition) as V1 (6.6.5). |
+| 46 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
+| 47 | SPJ with tables containing NULL partition values | NULL keys. |
+
+The `_metadata` tests use `checkMatchesV1(query, expectV2)`: it runs the query with the feature
+off and on, checks the rows are equal, and checks whether the plan with the feature on has a V2
+scan.
 
 ---
 
@@ -969,4 +1307,8 @@ Changes made while preparing the PR, and why:
 | Report scan statistics (6.4.6a) | **Planning regression.** Without statistics, Spark treats the V2 scan as infinitely large, so small tables stopped being broadcast when the feature was on. Test 16 failed before the fix. |
 | Row index column is nullable (6.5.2 a) | A non-nullable `_tmp_metadata_row_index` failed with "Required column is missing in data file" in the vectorized reader. Found by the DV tests. |
 | Deletion Vector support (6.5) | Falling back to V1 meant no SPJ for any table with DVs enabled, even before any row was deleted. Reuses V1's DV code, so no new DV logic. |
+| `_metadata` support (6.6) | With the feature on, any query reading `_metadata` from an eligible table failed analysis. Reuses V1's metadata type, extractors and row tracking formula. |
+| Metadata column only exposed on tables that stay V2 (6.6.1 a) | Spark resolves `_metadata` on the V2 relation before the V1 fallback; exposing it on every table would break `_metadata` on relations that fall back. Test 42. |
+| `_metadata` references remapped in DELETE / UPDATE (6.6.5 b) | Without it, a `_metadata` condition failed with an internal "missing attribute" error instead of V1's error. Tests 44–45 failed before the fix. |
+| Materialized row tracking columns keep the generated field's metadata (6.6.2 b) | Needed for `DeltaParquetFileFormat` to treat them as internal columns under column mapping, as V1 does. |
 | Test cleanup and new tests 6–10, 15 | Line length and style, plus coverage for type parsing, column order, time travel, DML, and the conf guard. |

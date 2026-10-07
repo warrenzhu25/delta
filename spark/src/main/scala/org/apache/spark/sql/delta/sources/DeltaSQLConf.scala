@@ -267,8 +267,7 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .doc("When true, reads of partitioned Delta tables use a DataSource V2 scan that reports " +
         "the table's partitioning to Spark, enabling Storage-Partitioned Join (SPJ) to avoid " +
         "shuffles when join/grouping keys match the table's partition columns. Requires " +
-        "spark.sql.sources.v2.bucketing.enabled=true. CDC reads always use the V1 scan. The " +
-        "_metadata column is not supported when the V2 scan is used.")
+        "spark.sql.sources.v2.bucketing.enabled=true. CDC reads always use the V1 scan.")
       .booleanConf
       .createWithDefault(false)
 
