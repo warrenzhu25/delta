@@ -28,6 +28,7 @@ import org.apache.spark.sql.catalyst.plans.physical.RangePartitioning
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
+import org.apache.spark.sql.execution.joins.BroadcastHashJoinExec
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 
@@ -382,6 +383,52 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
         checkAnswer(query, Seq((1, "p1"), (2, "p2")).toDF("id", "part"))
         assert(batchScans(query.queryExecution.executedPlan).isEmpty,
           "Should not use BatchScanExec when spark.sql.sources.v2.bucketing.enabled is false")
+      }
+    }
+  }
+
+  test("Small tables read through the V2 scan are still broadcast") {
+    withTable("t_stats1", "t_stats2") {
+      Seq((1, "a", "p1"), (2, "b", "p2")).toDF("id", "v1", "part")
+        .write.format("delta").partitionBy("part").saveAsTable("t_stats1")
+      Seq((1, "x", "p1"), (2, "y", "p2")).toDF("id", "v2", "part")
+        .write.format("delta").partitionBy("part").saveAsTable("t_stats2")
+
+      withSPJConf(enabled = true) {
+        withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB") {
+          // Join on a non-partition column: SPJ doesn't apply, a broadcast join is expected.
+          val query = spark.sql(
+            "SELECT t1.id, t1.v1, t2.v2 FROM t_stats1 t1 JOIN t_stats2 t2 ON t1.id = t2.id")
+          checkAnswer(query, Seq(Row(1, "a", "x"), Row(2, "b", "y")))
+          val plan = query.queryExecution.executedPlan
+          assert(batchScans(plan).size == 2, "Both sides should use the V2 scan")
+          assert(plan.collect { case j: BroadcastHashJoinExec => j }.nonEmpty,
+            s"Expected a broadcast join, got:\n$plan")
+        }
+      }
+    }
+  }
+
+  test("V2 scan reports the size of the selected files") {
+    withTable("t_stats") {
+      Seq((1, "p1"), (2, "p1"), (3, "p2")).toDF("id", "part")
+        .write.format("delta").partitionBy("part").saveAsTable("t_stats")
+      val snapshot = DeltaLog.forTable(spark, TableIdentifier("t_stats")).update()
+
+      withSPJConf(enabled = true) {
+        def scanSize(query: String): Long = {
+          val scans = batchScans(spark.sql(query).queryExecution.executedPlan)
+          assert(scans.size == 1)
+          scans.head.scan.asInstanceOf[DeltaBatchScan].estimateStatistics().sizeInBytes()
+            .getAsLong
+        }
+
+        assert(scanSize("SELECT * FROM t_stats") == snapshot.sizeInBytes)
+
+        val p2Size = snapshot.allFiles.filter("partitionValues.part = 'p2'").collect()
+          .map(_.size).sum
+        assert(p2Size > 0 && p2Size < snapshot.sizeInBytes)
+        assert(scanSize("SELECT * FROM t_stats WHERE part = 'p2'") == p2Size)
       }
     }
   }

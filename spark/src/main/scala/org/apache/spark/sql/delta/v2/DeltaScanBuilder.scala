@@ -17,7 +17,7 @@
 package org.apache.spark.sql.delta.v2
 
 import java.net.URI
-import java.util.Locale
+import java.util.{Locale, OptionalLong}
 
 import scala.util.Try
 
@@ -108,6 +108,7 @@ class DeltaBatchScan(
   extends Scan
   with Batch
   with SupportsReportPartitioning
+  with SupportsReportStatistics
   with DeltaLogging {
 
   override def description(): String = s"DeltaBatchScan[${deltaTable.name()}]"
@@ -198,6 +199,24 @@ class DeltaBatchScan(
       planPartitions(selectedFiles.map(f => (f.partitionValues, Seq(f))))
     }
   }
+
+  /**
+   * Statistics of the selected files, used by Spark's planner (e.g. to pick broadcast joins).
+   * Without them Spark assumes `spark.sql.defaultSizeInBytes` (effectively infinite).
+   * Like V1 (`HadoopFsRelation.sizeInBytes`), only the size is reported: the total size of the
+   * selected files scaled by `spark.sql.sources.fileCompressionFactor`. A row count is not
+   * reported because `filesForScan` doesn't keep per-file record counts by default.
+   */
+  private lazy val scanStatistics: Statistics = {
+    val compressionFactor = spark.sessionState.conf.fileCompressionFactor
+    val totalSize = (selectedFiles.map(_.size).sum * compressionFactor).toLong
+    new Statistics {
+      override def sizeInBytes(): OptionalLong = OptionalLong.of(totalSize)
+      override def numRows(): OptionalLong = OptionalLong.empty()
+    }
+  }
+
+  override def estimateStatistics(): Statistics = scanStatistics
 
   private def extractPartitionRow(
       partValuesMap: Map[String, String],
