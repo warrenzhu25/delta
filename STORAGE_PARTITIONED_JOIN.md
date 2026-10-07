@@ -25,6 +25,7 @@ can understand the change without reading the diff side by side.
    - [6.6 `_metadata` column support](#66-_metadata-column-support)
    - [6.7 Dynamic partition pruning](#67-dynamic-partition-pruning)
    - [6.8 File packing and splitting](#68-file-packing-and-splitting)
+   - [6.9 Columnar reads](#69-columnar-reads)
 7. [Design Details & Invariants](#7-design-details--invariants)
 8. [Behavior Matrix](#8-behavior-matrix)
 9. [Limitations](#9-limitations)
@@ -102,13 +103,13 @@ have to sort its partitions.
 
 | File | Change | Lines |
 | :--- | :--- | :--- |
-| `spark/src/main/scala/org/apache/spark/sql/delta/sources/DeltaSQLConf.scala` | New confs `storagePartitionedJoin.enabled` and (internal) `storagePartitionedJoin.deletionVectors.enabled`, `storagePartitionedJoin.fileSplitting.enabled` | +27 |
+| `spark/src/main/scala/org/apache/spark/sql/delta/sources/DeltaSQLConf.scala` | New confs `storagePartitionedJoin.enabled` and (internal) `storagePartitionedJoin.deletionVectors.enabled`, `storagePartitionedJoin.fileSplitting.enabled`, `storagePartitionedJoin.columnarReads.enabled` | +39 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/FallbackToV1Relations.scala` | Keep V2 relation when the table qualifies; table-level check shared with `DeltaTableV2.metadataColumns` | +43 / -2 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/catalog/DeltaTableV2.scala` | `with SupportsRead`, `newScanBuilder`; `with SupportsMetadataColumns`, `metadataColumns` (6.6.1) | +30 / -2 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/DeltaAnalysis.scala` | V2 → V1 conversion keeps `_metadata` references valid (6.6.5) | +93 / -7 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/files/TahoeFileIndex.scala` | Per-file constant metadata (row tracking, DV descriptor) moved into a reusable `TahoeFileIndex.constantMetadataForFile` | +30 / -17 |
-| `spark/src/main/scala/org/apache/spark/sql/delta/v2/DeltaScanBuilder.scala` | **New.** Scan builder, scan (with statistics and runtime filtering), input partition, reader factory (with `_metadata`), reader (with DV filtering), file packing and splitting (also within SPJ key groups) | ~845 |
-| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 59 tests | ~1320 |
+| `spark/src/main/scala/org/apache/spark/sql/delta/v2/DeltaScanBuilder.scala` | **New.** Scan builder, scan (with statistics and runtime filtering), input partition, reader factory (with `_metadata`), reader (with DV filtering), columnar reader, file packing and splitting (also within SPJ key groups) | ~950 |
+| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 61 tests | ~1420 |
 
 No other code paths change when the conf is `false`. The only extra work is two conf lookups per
 Delta relation during analysis (plus two more when Spark asks a Delta table for its metadata
@@ -204,6 +205,8 @@ val DELTA_STORAGE_PARTITIONED_JOIN_FILE_SPLITTING_ENABLED =
 - `storagePartitionedJoin.fileSplitting.enabled` is an internal kill switch for file splitting
   and packing (6.8). It defaults to `true`; setting it to `false` restores the original layout of
   one input partition per file (or per partition key with SPJ), with every file read whole.
+- `storagePartitionedJoin.columnarReads.enabled` is an internal kill switch for columnar reads
+  (6.9). It defaults to `true`; setting it to `false` makes the scan always return rows.
 
 ### 6.2 `FallbackToV1Relations.scala`: when to keep the V2 relation
 
@@ -357,7 +360,8 @@ class DeltaBatchScan(val spark, val deltaTable, val tableSchema, val readSchema,
 
   override def description(): String = s"DeltaBatchScan[${deltaTable.name()}]"   // shown in EXPLAIN
   override def toBatch: Batch = this
-  override def columnarSupportMode() = Scan.ColumnarSupportMode.UNSUPPORTED     // rows only
+  override def columnarSupportMode() =                    // batches when V1 would return them, 6.9
+    if (columnarReads) Scan.ColumnarSupportMode.SUPPORTED else Scan.ColumnarSupportMode.UNSUPPORTED
 
   private val snapshot = deltaTable.initialSnapshot
   private val protocol = snapshot.protocol
@@ -617,7 +621,7 @@ class DeltaPartitionReaderFactory(spark, dataSchema, partitionSchema, readSchema
   private val readerBuilder = parquetFormat.buildReaderWithPartitionValues(
     sparkSession = spark, dataSchema = dataSchema, partitionSchema = partitionSchema,
     requiredSchema = readDataSchema, filters = dataFilters,
-    options = Map(FileFormat.OPTION_RETURNING_BATCH -> "false"),
+    options = Map(FileFormat.OPTION_RETURNING_BATCH -> columnarReads.toString),   // 6.9
     hadoopConf = serializableHadoopConf.value)
 
   // (d) Executor side: one reader per task, with a projection back to readSchema order
@@ -652,7 +656,8 @@ class DeltaPartitionReaderFactory(spark, dataSchema, partitionSchema, readSchema
   `PartitionedFile => Iterator[InternalRow]`, the same way V1 builds its reader. `dataSchema` is
   the full table schema, as in V1's `HadoopFsRelation` (see the comment in `DeltaLog.createRelation`).
   `DeltaParquetFileFormat` takes care of column-mapping physical names and filter translation.
-  `OPTION_RETURNING_BATCH=false` asks for rows, not `ColumnarBatch`es.
+  `OPTION_RETURNING_BATCH` asks for rows, or for `ColumnarBatch`es when the scan reads columnar
+  batches (6.9).
   `deltaLog.newDeltaHadoopConf()` (passed in by `createReaderFactory`) carries the table's storage
   credentials and options to executors.
 - **(d)** `createReader` runs on executors. `BoundReference` plus `UnsafeProjection` is a
@@ -1373,6 +1378,84 @@ partitioning is *not grouped*. `EnsureRequirements` then decides per operator:
 - **Kill switch:** `storagePartitionedJoin.fileSplitting.enabled=false` (6.1) goes back to one
   whole-file input partition per key (SPJ) or per file (no SPJ).
 
+### 6.9 Columnar reads
+
+The scan used to report `columnarSupportMode = UNSUPPORTED`. The Parquet vectorized reader
+decoded batches, but Spark's `ParquetFileFormat` turned them back into rows, which the scan
+projected one at a time. V1's `FileSourceScanExec` instead hands the batches straight to
+whole-stage codegen (`ColumnarToRow`), which is much faster for wide or large scans. The V2 scan
+now does the same.
+
+#### 6.9.1 When the scan returns batches
+
+```scala
+override def columnarSupportMode(): Scan.ColumnarSupportMode =
+  if (columnarReads) Scan.ColumnarSupportMode.SUPPORTED else Scan.ColumnarSupportMode.UNSUPPORTED
+
+private lazy val columnarReads: Boolean = {
+  val conf = spark.sessionState.conf
+  val readsMetadataColumn = readSchema.fieldNames.contains(FileFormat.METADATA_NAME) &&
+    !tableSchema.fieldNames.contains(FileFormat.METADATA_NAME)
+  conf.getConf(DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_COLUMNAR_READS_ENABLED) &&   // (a)
+    !hasDeletionVectors &&                                                             // (b)
+    !readsMetadataColumn &&                                                            // (b)
+    conf.wholeStageEnabled &&                                                          // (c)
+    !WholeStageCodegenExec.isTooManyFields(conf, readSchema) &&                        // (c)
+    new DeltaParquetFileFormat(protocol, metadata).supportBatch(spark, readSchema)     // (c)
+}
+```
+
+- **(a) Kill switch:** `storagePartitionedJoin.columnarReads.enabled` (internal, default `true`).
+- **(b) Row-only features.** DV filtering (6.5.3) and `_metadata` (6.6.3) are applied per row by
+  `DeltaBatchPartitionReader`, so scans with them stay row-based. `hasDeletionVectors` is only
+  true when a *selected* file has a DV, so DV-enabled tables without deletes, or partitions
+  without DVs, still get batches. A table column named `_metadata` is a normal data column.
+- **(c) Same rule as V1.** `FileSourceScanExec.supportsColumnar` requires whole-stage codegen
+  (enabled, and not more than `spark.sql.codegen.maxFields` fields) and
+  `fileFormat.supportBatch`, which for Parquet is `ParquetUtils.isBatchReadSupportedForSchema`:
+  the vectorized reader is on and every column type is supported (atomic types; nested types
+  only with `spark.sql.parquet.enableNestedColumnVectorizedReader`). The check uses `readSchema`,
+  which has the same columns as the file reader's output (data columns plus partition columns),
+  so `ParquetFileFormat`'s own assertion for `OPTION_RETURNING_BATCH=true` holds.
+- Spark calls `columnarSupportMode()` while planning, so the decision is fixed for the query.
+  `SUPPORTED` means every input partition is read as batches; runtime filtering (6.7) doesn't
+  change that.
+
+#### 6.9.2 Reading batches
+
+```scala
+// DeltaPartitionReaderFactory
+private val readerBuilder = parquetFormat.buildReaderWithPartitionValues(...,
+  options = Map(FileFormat.OPTION_RETURNING_BATCH -> columnarReads.toString), ...)
+
+private val batchColumnOrdinals: Array[Int] =        // readSchema column -> batch column
+  if (columnarReads) readSchema.map(f => fileOutputSchema.fieldNames.indexWhere(resolver(_, f.name)))
+  else Array.empty
+
+override def supportColumnarReads(partition: InputPartition): Boolean = columnarReads
+override def createColumnarReader(partition: InputPartition): PartitionReader[ColumnarBatch] =
+  new DeltaColumnarPartitionReader(partition, readerBuilder, batchColumnOrdinals)
+
+// DeltaColumnarPartitionReader.next(): the next batch of the current file, or of the next file
+val batch = currentFileReader.get.next().asInstanceOf[Any].asInstanceOf[ColumnarBatch]
+currentBatch = new ColumnarBatch(columnOrdinals.map(batch.column), batch.numRows())
+```
+
+- With `OPTION_RETURNING_BATCH=true`, the Parquet reader returns `ColumnarBatch`es typed as
+  `InternalRow`s, as it does for V1. Each batch has the requested data columns followed by the
+  partition columns, which the reader fills as constant vectors from
+  `PartitionedFile.partitionValues` (so partition values still come from the Delta log, 6.4.8 a).
+- `DeltaParquetFileFormat` returns the Parquet reader unchanged when no DV or row index column is
+  requested, which (b) guarantees.
+- **Column order.** Spark expects batches in `readSchema` order. The batch is rebuilt over the
+  same column vectors in that order; nothing is copied. This is the columnar counterpart of the
+  row projection (6.4.8 b), and it uses the same name resolution, so column mapping works the same
+  way (the batch columns are in logical order; `DeltaParquetFileFormat` maps physical names).
+- `DeltaColumnarPartitionReader` goes through the files of the input partition like
+  `DeltaBatchPartitionReader` (6.4.9): byte ranges of split files (6.8) are read the same way,
+  and each file reader is closed before the next one is opened and in `close()`.
+- Spark adds `ColumnarToRow` above the scan, and counts output rows from the batch sizes.
+
 ---
 
 ## 7. Design Details & Invariants
@@ -1436,6 +1519,7 @@ row tracking formula as V1 (6.6), and every `_metadata` test compares V2 output 
 | CDC read (`readChangeFeed`) | V1 | No |
 | DML target (UPDATE/DELETE/MERGE) | V1 (existing `DeltaRelation` handling; `_metadata` references remapped, 6.6.5) | No |
 | Partitioned table, query reads no partition column | V2, `UnknownPartitioning`, files split and packed like V1 (6.8) | No |
+| Vectorized reader and whole-stage codegen on, supported types, no DV files or `_metadata` | V2, columnar batches like V1 (6.9) | Unchanged |
 | Partitioned table, both join sides key-grouped on compatible keys | V2, `KeyGroupedPartitioning`; large keys split into several input partitions (6.8.2) | **Yes** |
 | One side V2 key-grouped, other side V1 or incompatible | V2 + V1 | No (Spark shuffles) |
 | Join on a partition column with a selective other side (DPP) | V2, pruned at runtime to the matching partitions (6.7) | Unchanged (Yes if the join is SPJ) |
@@ -1449,8 +1533,8 @@ row tracking formula as V1 (6.6), and every `_metadata` test compares V2 output 
 - **Skewed keys need partial clustering:** large key groups are split (6.8.2), but Spark merges
   the splits of a key back into one task unless `partiallyClusteredDistribution.enabled` is on
   and the join type allows it, or the operator doesn't need the key grouped.
-- **Row-based reads only:** `columnarSupportMode = UNSUPPORTED`. The Parquet reader may decode
-  vectorized internally, but rows are handed to Spark one at a time.
+- **Row-based reads with Deletion Vectors or `_metadata`:** scans that read DV files or the
+  `_metadata` column hand rows to Spark one at a time (6.9). V1 returns batches for these too.
 - **CDC:** always V1.
 - **Deletion Vector reads are row-based:** deleted rows are skipped one at a time in the reader,
   not through a vectorized filter.
@@ -1466,7 +1550,7 @@ row tracking formula as V1 (6.6), and every `_metadata` test compares V2 output 
 
 ## 10. Test Suite
 
-`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 59
+`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 61
 tests.
 
 **Setup (`withSPJConf`):** turns on both SPJ confs, `pushPartValues=true`,
@@ -1538,8 +1622,10 @@ deterministic.
 | 54–55 | Scans without SPJ split Deletion Vector files only with the metadata row index (`useMetadataRowIndex` true / false) | DV files split with the metadata row index, read whole without it (6.8 a); rows and `_metadata.row_index` equal V1. |
 | 56 | SPJ splits large partitions into several input partitions with the same key | A skewed table (one large partition with many small row groups, one small partition) and `maxPartitionBytes=64KB`: the large key has several input partitions; join, left join and aggregation equal V1 and stay shuffle-free with `partiallyClusteredDistribution` off and on; one input partition per key with the kill switch off (6.8.2). |
 | 57 | Dynamic partition pruning on a scan with split partitions | Star join where the fact partitions are split into several input partitions; DPP with and without broadcast reads 2 files and keeps Spark's per-key rule (6.7.3 e). |
-| 58 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
-| 59 | SPJ with tables containing NULL partition values | NULL keys. |
+| 58 | Scans return columnar batches when the V1 scan would | Partition column in the middle, column mapping with a renamed column, DATE / DECIMAL / ARRAY / STRUCT / MAP columns, two files per partition: SPJ joins, a scan without SPJ, a partition-column-only and a column-less `count(*)` scan are columnar and equal V1; with nested vectorized reads off, only atomic reads are columnar (6.9). |
+| 59 | Scans return rows when columnar batches can't be used | Vectorized reader off, whole-stage codegen off, too many fields, and the kill switch each give rows and equal V1; `_metadata` reads are row-based; a DV table is columnar until a DELETE writes a DV (6.9.1 b). |
+| 60 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
+| 61 | SPJ with tables containing NULL partition values | NULL keys. |
 
 The `_metadata` tests use `checkMatchesV1(query, expectV2)`: it runs the query with the feature
 off and on, checks the rows are equal, and checks whether the plan with the feature on has a V2
@@ -1600,4 +1686,5 @@ Changes made while preparing the PR, and why:
 | Dynamic partition pruning (6.7) | **Planning regression.** V1 scans are pruned by DPP; without `SupportsRuntimeV2Filtering`, turning the feature on made star joins read the whole fact table. Implemented on partition values with V1's parsing, and regrouped so the keys stay a subset, as Spark requires for key-grouped scans. |
 | File packing and splitting for scans without SPJ (6.8) | **Performance regression.** V1 packs small files and splits large ones; the V2 scan used one task per whole file, which is slow for tables with many small files or a few large ones. Reuses Spark's `FilePartition` code and V1's splittability rule. |
 | Split large key groups for SPJ scans (6.8.2) | **Skew.** With SPJ each key was one task reading whole files, so one large partition made one long task. Spark 4.2 accepts several input partitions per key and can spread them with partially clustered distribution. DPP now removes files from the planned splits so the number of splits per key never grows. |
+| Columnar reads (6.9) | **Performance regression.** V1 hands Parquet batches to whole-stage codegen; the V2 scan turned them into rows and projected each one. Uses V1's rule for when to return batches, and only reorders the batch's column vectors. Most existing tests now run columnar, so they cover it too. |
 | Test cleanup and new tests 6–10, 15 | Line length and style, plus coverage for type parsing, column order, time travel, DML, and the conf guard. |

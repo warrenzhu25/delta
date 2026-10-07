@@ -42,12 +42,14 @@ import org.apache.spark.sql.connector.expressions.{Expression => V2Expression, E
 import org.apache.spark.sql.connector.expressions.filter.{Predicate => V2Predicate}
 import org.apache.spark.sql.connector.read._
 import org.apache.spark.sql.connector.read.partitioning.{KeyGroupedPartitioning, Partitioning, UnknownPartitioning}
+import org.apache.spark.sql.execution.WholeStageCodegenExec
 import org.apache.spark.sql.execution.datasources.{FileFormat, FilePartition, PartitionedFile}
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.internal.connector.PredicateUtils
 import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.{DataType, LongType, StructField, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.util.SerializableConfiguration
 
 /**
@@ -119,11 +121,31 @@ class DeltaBatchScan(
   override def toBatch: Batch = this
 
   override def columnarSupportMode(): Scan.ColumnarSupportMode =
-    Scan.ColumnarSupportMode.UNSUPPORTED
+    if (columnarReads) Scan.ColumnarSupportMode.SUPPORTED
+    else Scan.ColumnarSupportMode.UNSUPPORTED
 
   private val snapshot: Snapshot = deltaTable.initialSnapshot
   private val protocol: Protocol = snapshot.protocol
   private val metadata: Metadata = snapshot.metadata
+
+  /**
+   * Whether the scan returns columnar batches. Like the V1 `FileSourceScanExec`, batches are only
+   * returned when whole-stage codegen can consume them and the Parquet reader can return every
+   * read column in a batch (vectorized reader enabled, supported types). Scans that read Deletion
+   * Vector files or the `_metadata` column are row-based: their extra values (deleted rows,
+   * per-file metadata) are applied per row by [[DeltaBatchPartitionReader]].
+   */
+  private lazy val columnarReads: Boolean = {
+    val conf = spark.sessionState.conf
+    val readsMetadataColumn = readSchema.fieldNames.contains(FileFormat.METADATA_NAME) &&
+      !tableSchema.fieldNames.contains(FileFormat.METADATA_NAME)
+    conf.getConf(DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_COLUMNAR_READS_ENABLED) &&
+      !hasDeletionVectors &&
+      !readsMetadataColumn &&
+      conf.wholeStageEnabled &&
+      !WholeStageCodegenExec.isTooManyFields(conf, readSchema) &&
+      new DeltaParquetFileFormat(protocol, metadata).supportBatch(spark, readSchema)
+  }
 
   // scalastyle:off caselocale
   private lazy val readFieldNamesLower: Set[String] =
@@ -445,7 +467,8 @@ class DeltaBatchScan(
       serializableHadoopConf = hadoopConf,
       deletionVectorTablePath =
         if (hasDeletionVectors) Some(deltaTable.deltaLog.dataPath.toString) else None,
-      useMetadataRowIndex = useMetadataRowIndex
+      useMetadataRowIndex = useMetadataRowIndex,
+      columnarReads = columnarReads
     )
   }
 }
@@ -527,6 +550,10 @@ case class DeltaKeyGroupedInputPartition(
  *                                selected file has a Deletion Vector.
  * @param useMetadataRowIndex     Whether the row index used for DV filtering comes from the
  *                                Parquet reader (`_metadata.row_index`) or from a row counter.
+ * @param columnarReads           Whether partitions are read as columnar batches (see
+ *                                `DeltaBatchScan.columnarReads`). Only set when there are no
+ *                                Deletion Vectors and no `_metadata` column, so the file
+ *                                reader's batches only need their columns reordered.
  */
 class DeltaPartitionReaderFactory(
     spark: SparkSession,
@@ -538,7 +565,8 @@ class DeltaPartitionReaderFactory(
     pushedFilters: Array[Filter],
     serializableHadoopConf: SerializableConfiguration,
     deletionVectorTablePath: Option[String] = None,
-    useMetadataRowIndex: Boolean = true)
+    useMetadataRowIndex: Boolean = true,
+    columnarReads: Boolean = false)
   extends PartitionReaderFactory {
 
   import DeltaPartitionReaderFactory._
@@ -729,7 +757,7 @@ class DeltaPartitionReaderFactory(
     partitionSchema = partitionSchema,
     requiredSchema = fileRequiredSchema,
     filters = dataFilters,
-    options = Map(FileFormat.OPTION_RETURNING_BATCH -> "false"),
+    options = Map(FileFormat.OPTION_RETURNING_BATCH -> columnarReads.toString),
     hadoopConf = serializableHadoopConf.value
   )
 
@@ -748,6 +776,29 @@ class DeltaPartitionReaderFactory(
     }
     new DeltaBatchPartitionReader(
       deltaPartition, readerBuilder, projection, isRowDeletedOrdinal, constantMetadata)
+  }
+
+  /**
+   * For columnar reads, the ordinal in the file reader's batches (`fileOutputSchema`: data
+   * columns, then partition columns) of each `readSchema` column.
+   */
+  private val batchColumnOrdinals: Array[Int] = if (columnarReads) {
+    val resolver = spark.sessionState.conf.resolver
+    readSchema.map { f =>
+      val idx = fileOutputSchema.fieldNames.indexWhere(resolver(_, f.name))
+      require(idx >= 0, s"Column ${f.name} not found in the file reader output")
+      idx
+    }.toArray
+  } else {
+    Array.empty
+  }
+
+  override def supportColumnarReads(partition: InputPartition): Boolean = columnarReads
+
+  override def createColumnarReader(partition: InputPartition): PartitionReader[ColumnarBatch] = {
+    require(columnarReads, "Columnar reads are not enabled for this scan")
+    new DeltaColumnarPartitionReader(
+      partition.asInstanceOf[DeltaKeyGroupedInputPartition], readerBuilder, batchColumnOrdinals)
   }
 }
 
@@ -838,6 +889,59 @@ class DeltaBatchPartitionReader(
   }
 
   override def get(): InternalRow = currentRow
+
+  override def close(): Unit = {
+    closeCurrentFileReader()
+  }
+}
+
+/**
+ * Columnar counterpart of [[DeltaBatchPartitionReader]]: reads the files of an InputPartition
+ * one after another with a file reader that returns [[ColumnarBatch]]es (the Parquet vectorized
+ * reader with `FileFormat.OPTION_RETURNING_BATCH`), and returns each batch with its columns in
+ * `readSchema` order. The column vectors are not copied.
+ *
+ * @param columnOrdinals For each `readSchema` column, its ordinal in the file reader's batches.
+ */
+class DeltaColumnarPartitionReader(
+    partition: DeltaKeyGroupedInputPartition,
+    readerBuilder: PartitionedFile => Iterator[InternalRow],
+    columnOrdinals: Array[Int])
+  extends PartitionReader[ColumnarBatch] {
+
+  private val fileIterator: Iterator[DeltaScanFileInfo] = partition.files.iterator
+  private var currentFileReader: Option[Iterator[InternalRow]] = None
+  private var currentBatch: ColumnarBatch = _
+
+  private def closeCurrentFileReader(): Unit = {
+    currentFileReader.foreach {
+      case closeable: AutoCloseable => closeable.close()
+      case _ =>
+    }
+    currentFileReader = None
+  }
+
+  /** Opens the next files until one has remaining batches. Returns false when all are consumed. */
+  private def advanceToNextFile(): Boolean = {
+    while (currentFileReader.forall(!_.hasNext) && fileIterator.hasNext) {
+      closeCurrentFileReader()
+      currentFileReader = Some(readerBuilder(fileIterator.next().toPartitionedFile))
+    }
+    currentFileReader.exists(_.hasNext)
+  }
+
+  override def next(): Boolean = {
+    if (advanceToNextFile()) {
+      // The file reader returns batches typed as rows, like for the V1 file scan.
+      val batch = currentFileReader.get.next().asInstanceOf[Any].asInstanceOf[ColumnarBatch]
+      currentBatch = new ColumnarBatch(columnOrdinals.map(batch.column), batch.numRows())
+      true
+    } else {
+      false
+    }
+  }
+
+  override def get(): ColumnarBatch = currentBatch
 
   override def close(): Unit = {
     closeCurrentFileReader()

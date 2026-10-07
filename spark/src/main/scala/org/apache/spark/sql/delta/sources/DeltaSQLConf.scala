@@ -291,6 +291,16 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .booleanConf
       .createWithDefault(true)
 
+  val DELTA_STORAGE_PARTITIONED_JOIN_COLUMNAR_READS_ENABLED =
+    buildConf("storagePartitionedJoin.columnarReads.enabled")
+      .internal()
+      .doc("When true, the Storage-Partitioned Join V2 scan returns columnar batches from the " +
+        "Parquet vectorized reader when the V1 file scan would (whole-stage codegen enabled, " +
+        "supported column types), and the scan reads no Deletion Vector files and no " +
+        "_metadata column. When false, the scan always returns rows.")
+      .booleanConf
+      .createWithDefault(true)
+
   val DELTA_COMMIT_VALIDATION_ENABLED =
     buildConf("commitValidation.enabled")
       .internal()

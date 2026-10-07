@@ -1279,6 +1279,108 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
     }
   }
 
+  /** Whether the V2 scan of `table` in `df` returns columnar batches. */
+  private def isColumnar(df: DataFrame, table: String): Boolean =
+    batchScans(df.queryExecution.executedPlan)
+      .find(_.scan.description().endsWith(s"$table]")).get.supportsColumnar
+
+  /**
+   * `t_col`: partition column in the middle of the schema, column mapping with a renamed column,
+   * typed and nested columns, two files per partition. `t_col2`: a small table to join with.
+   */
+  private def createColumnarTables(): Unit = {
+    sql("CREATE TABLE t_col (id INT, d DATE, part STRING, dec DECIMAL(10, 2), " +
+      "arr ARRAY<INT>, st STRUCT<a: INT, b: STRING>, m MAP<STRING, INT>, v STRING) " +
+      "USING delta PARTITIONED BY (part) TBLPROPERTIES ('delta.columnMapping.mode' = 'name')")
+    for (batch <- 0 until 2) {
+      sql("INSERT INTO t_col SELECT /*+ REPARTITION(1) */ CAST(id AS INT), " +
+        "date_add(DATE'2024-01-01', CAST(id AS INT)), CONCAT('p', id % 3), " +
+        "CAST(id AS DECIMAL(10, 2)) / 4, array(CAST(id AS INT), NULL), " +
+        "named_struct('a', CAST(id AS INT), 'b', CAST(id AS STRING)), " +
+        "map('k', CAST(id AS INT)), IF(id % 4 = 0, NULL, CAST(id AS STRING)) " +
+        s"FROM range(${batch * 100}, ${batch * 100 + 100})")
+    }
+    sql("ALTER TABLE t_col RENAME COLUMN v TO v_renamed")
+    sql("CREATE TABLE t_col2 (id INT, w STRING, part STRING) USING delta PARTITIONED BY (part)")
+    insertValues("t_col2", "(1, 'x', 'p0'), (2, 'y', 'p1'), (3, 'z', 'p3')")
+  }
+
+  test("Scans return columnar batches when the V1 scan would") {
+    withTable("t_col", "t_col2") {
+      createColumnarTables()
+      val join = "SELECT c.*, t.w FROM t_col c JOIN t_col2 t ON c.part = t.part"
+      val atomicJoin = "SELECT c.id, c.d, c.part, c.dec, c.v_renamed, t.w FROM t_col c " +
+        "JOIN t_col2 t ON c.part = t.part"
+      withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_NESTED_COLUMN_ENABLED.key -> "true") {
+        Seq(join, atomicJoin).foreach(checkSPJAnswerMatchesV1)
+        // Scans without SPJ, a partition column only, and no column at all.
+        Seq(
+          "SELECT id, arr, st, m, v_renamed FROM t_col WHERE id % 7 = 1",
+          "SELECT part, count(*) FROM t_col GROUP BY part",
+          "SELECT count(*) FROM t_col").foreach(q => checkMatchesV1(sql(q)))
+        withSPJConf(enabled = true) {
+          Seq(join, atomicJoin).foreach { q =>
+            assert(isColumnar(sql(q), "t_col"), q)
+            assert(isColumnar(sql(q), "t_col2"), q)
+          }
+          assert(isColumnar(sql("SELECT id, arr FROM t_col"), "t_col"))
+          assert(isColumnar(sql("SELECT count(*) FROM t_col"), "t_col"))
+        }
+      }
+      // Without nested column support in the vectorized reader, only atomic reads are columnar.
+      withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_NESTED_COLUMN_ENABLED.key -> "false") {
+        Seq(join, atomicJoin).foreach(checkSPJAnswerMatchesV1)
+        withSPJConf(enabled = true) {
+          assert(!isColumnar(sql(join), "t_col"))
+          assert(isColumnar(sql(atomicJoin), "t_col"))
+        }
+      }
+    }
+  }
+
+  test("Scans return rows when columnar batches can't be used") {
+    withTable("t_col", "t_col2", "t_dv1") {
+      createColumnarTables()
+      val join = "SELECT c.id, c.part, c.v_renamed, t.w FROM t_col c " +
+        "JOIN t_col2 t ON c.part = t.part"
+      Seq(
+        SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> "false",
+        SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false",
+        SQLConf.WHOLESTAGE_MAX_NUM_FIELDS.key -> "2",
+        DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_COLUMNAR_READS_ENABLED.key -> "false"
+      ).foreach { case (key, value) =>
+        withSQLConf(key -> value) {
+          checkSPJAnswerMatchesV1(join)
+          withSPJConf(enabled = true) {
+            assert(!isColumnar(sql(join), "t_col"), s"$key=$value")
+          }
+        }
+      }
+
+      // `_metadata` is built per row.
+      val withMetadata = "SELECT id, part, _metadata.file_name FROM t_col"
+      checkMatchesV1(sql(withMetadata))
+      withSPJConf(enabled = true) {
+        assert(!isColumnar(sql(withMetadata), "t_col"))
+      }
+
+      // Deletion Vectors are applied per row, but only when a selected file has one.
+      createDVTable("t_dv1")
+      insertValues("t_dv1", "(1, 'a', 'p0'), (2, 'b', 'p0'), (3, 'c', 'p1')")
+      val dvJoin = "SELECT d.id, d.v, t.w, d.part FROM t_dv1 d JOIN t_col2 t ON d.part = t.part"
+      withSPJConf(enabled = true) {
+        assert(isColumnar(sql(dvJoin), "t_dv1"))
+      }
+      sql("DELETE FROM t_dv1 WHERE id = 2")
+      assert(numFilesWithDVs("t_dv1") == 1)
+      checkSPJAnswerMatchesV1(dvJoin)
+      withSPJConf(enabled = true) {
+        assert(!isColumnar(sql(dvJoin), "t_dv1"))
+        assert(isColumnar(sql(dvJoin), "t_col2"))
+      }
+    }
+  }
+
   test("SPJ with Delta Column Mapping (name mode)") {
     withTable("t_cm1", "t_cm2") {
       sql("CREATE TABLE t_cm1 (id INT, part STRING) USING delta PARTITIONED BY (part) " +
