@@ -27,7 +27,7 @@ import org.apache.spark.sql.{DataFrame, QueryTest, Row}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.expressions.{DynamicPruningExpression, Literal}
 import org.apache.spark.sql.catalyst.plans.physical.RangePartitioning
-import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.{FileSourceScanExec, SparkPlan}
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
 import org.apache.spark.sql.execution.joins.BroadcastHashJoinExec
@@ -1377,6 +1377,76 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
       withSPJConf(enabled = true) {
         assert(!isColumnar(sql(dvJoin), "t_dv1"))
         assert(isColumnar(sql(dvJoin), "t_col2"))
+      }
+    }
+  }
+
+  /** The driver metrics shared by the V1 file scan and the V2 scan of `table` in `df`. */
+  private def fileMetrics(df: DataFrame, table: String): Map[String, Long] = {
+    df.collect()
+    val plan = df.queryExecution.executedPlan
+    val metrics = batchScans(plan).find(_.scan.description().endsWith(s"$table]"))
+      .map(_.metrics)
+      .getOrElse(plan.collectFirst {
+        case s: FileSourceScanExec if s.relation.location.rootPaths.exists(_.getName == table) =>
+          s.metrics
+      }.get)
+    Seq("numFiles", "filesSize", "numPartitions").map(n => n -> metrics(n).value).toMap
+  }
+
+  test("V2 scan reports file metrics like V1") {
+    withTable("t_m1", "t_m2") {
+      sql("CREATE TABLE t_m1 (id INT, v STRING, part STRING) USING delta PARTITIONED BY (part)")
+      sql("CREATE TABLE t_m2 (id INT, w STRING, part STRING) USING delta PARTITIONED BY (part)")
+      // Two files in each of three partitions.
+      for (_ <- 0 until 2) {
+        insertValues("t_m1", "(1, 'a', 'p0'), (2, 'b', 'p1'), (3, 'c', 'p2')")
+      }
+      insertValues("t_m2", "(1, 'x', 'p0'), (2, 'y', 'p1'), (3, 'z', 'p2')")
+      val join = "SELECT a.id, a.v, b.w, a.part FROM t_m1 a JOIN t_m2 b ON a.part = b.part"
+      val totalSize = DeltaLog.forTable(spark, TableIdentifier("t_m1")).update().sizeInBytes
+      for (query <- Seq(join, join + " WHERE a.part = 'p1'", "SELECT id FROM t_m1")) {
+        val v1 = withSPJConf(enabled = false) { fileMetrics(sql(query), "t_m1") }
+        val v2 = withSPJConf(enabled = true) { fileMetrics(sql(query), "t_m1") }
+        assert(v2 == v1, query)
+      }
+      withSPJConf(enabled = true) {
+        assert(fileMetrics(sql(join), "t_m1") ==
+          Map("numFiles" -> 6, "filesSize" -> totalSize, "numPartitions" -> 3))
+        // Files read in several byte ranges count once.
+        withSQLConf(
+            SQLConf.FILES_MAX_PARTITION_BYTES.key -> "128",
+            SQLConf.FILES_OPEN_COST_IN_BYTES.key -> "1",
+            SQLConf.FILES_MIN_PARTITION_NUM.key -> "1") {
+          val df = sql("SELECT id FROM t_m1")
+          assert(fileMetrics(df, "t_m1")("numFiles") == 6)
+          assert(plannedPartitions(df).map(_.files.length).sum > 6)
+        }
+      }
+    }
+  }
+
+  test("V2 scan metrics after dynamic partition pruning and with Deletion Vectors") {
+    withTable("t_fact", "t_dim", "t_dv1") {
+      createStarSchema(partitionedDim = true)
+      withDPPConf(broadcast = true) {
+        val df = sql(starQuery.replace("<region>", "US"))
+        assert(dppFilteredScans(df.queryExecution.executedPlan).nonEmpty)
+        val metrics = fileMetrics(df, "t_fact")
+        assert(metrics("numFiles") == 2 && metrics("numPartitions") == 2, metrics)
+      }
+
+      createDVTable("t_dv1")
+      insertValues("t_dv1", "(1, 'a', 'p0'), (2, 'b', 'p0'), (3, 'c', 'p0'), (4, 'd', 'p1')")
+      sql("DELETE FROM t_dv1 WHERE id IN (1, 3)")
+      assert(numFilesWithDVs("t_dv1") == 1)
+      withSPJConf(enabled = true) {
+        val df = sql("SELECT id, part FROM t_dv1")
+        // Run once: task metrics add up over executions.
+        assert(df.collect().sortBy(_.getInt(0)).toSeq == Seq(Row(2, "p0"), Row(4, "p1")))
+        val scan = batchScans(df.queryExecution.executedPlan).head
+        assert(scan.metrics("numDeletedRowsSkipped").value == 2)
+        assert(scan.metrics("numOutputRows").value == 2)
       }
     }
   }

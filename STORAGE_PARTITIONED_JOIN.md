@@ -26,6 +26,7 @@ can understand the change without reading the diff side by side.
    - [6.7 Dynamic partition pruning](#67-dynamic-partition-pruning)
    - [6.8 File packing and splitting](#68-file-packing-and-splitting)
    - [6.9 Columnar reads](#69-columnar-reads)
+   - [6.10 Scan metrics](#610-scan-metrics)
 7. [Design Details & Invariants](#7-design-details--invariants)
 8. [Behavior Matrix](#8-behavior-matrix)
 9. [Limitations](#9-limitations)
@@ -108,8 +109,8 @@ have to sort its partitions.
 | `spark/src/main/scala/org/apache/spark/sql/delta/catalog/DeltaTableV2.scala` | `with SupportsRead`, `newScanBuilder`; `with SupportsMetadataColumns`, `metadataColumns` (6.6.1) | +30 / -2 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/DeltaAnalysis.scala` | V2 → V1 conversion keeps `_metadata` references valid (6.6.5) | +93 / -7 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/files/TahoeFileIndex.scala` | Per-file constant metadata (row tracking, DV descriptor) moved into a reusable `TahoeFileIndex.constantMetadataForFile` | +30 / -17 |
-| `spark/src/main/scala/org/apache/spark/sql/delta/v2/DeltaScanBuilder.scala` | **New.** Scan builder, scan (with statistics and runtime filtering), input partition, reader factory (with `_metadata`), reader (with DV filtering), columnar reader, file packing and splitting (also within SPJ key groups) | ~950 |
-| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 61 tests | ~1420 |
+| `spark/src/main/scala/org/apache/spark/sql/delta/v2/DeltaScanBuilder.scala` | **New.** Scan builder, scan (with statistics and runtime filtering), input partition, reader factory (with `_metadata`), reader (with DV filtering), columnar reader, file packing and splitting (also within SPJ key groups), scan metrics | ~1020 |
+| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 63 tests | ~1490 |
 
 No other code paths change when the conf is `false`. The only extra work is two conf lookups per
 Delta relation during analysis (plus two more when Spark asks a Delta table for its metadata
@@ -1456,6 +1457,51 @@ currentBatch = new ColumnarBatch(columnOrdinals.map(batch.column), batch.numRows
   and each file reader is closed before the next one is opened and in `close()`.
 - Spark adds `ColumnarToRow` above the scan, and counts output rows from the batch sizes.
 
+### 6.10 Scan metrics
+
+V1's `FileSourceScanExec` shows "number of files read", "size of files read" and "number of
+partitions read" in the SQL UI. Without them, the `BatchScan` node only showed the number of
+output rows, which made it hard to see what partition pruning, data skipping and DPP did. The
+V2 scan now reports the same metrics through Spark's DataSource V2 custom metrics API.
+
+```scala
+override def supportedCustomMetrics(): Array[CustomMetric] = DeltaScanMetrics.supportedMetrics
+
+override def reportDriverMetrics(): Array[CustomTaskMetric] = {                         // (a)
+  val files = planInputPartitions().iterator
+    .flatMap(_.asInstanceOf[DeltaKeyGroupedInputPartition].files.iterator)
+    .map(f => f.path -> f).toMap.values                                                 // (b)
+  Array(
+    taskMetric(NUM_FILES, files.size),
+    taskMetric(FILES_SIZE, files.iterator.map(_.size).sum),
+    taskMetric(NUM_PARTITIONS, files.iterator.map(_.partitionValues).toSet.size))       // (c)
+}
+
+// DeltaBatchPartitionReader                                                             (d)
+override def currentMetricsValues(): Array[CustomTaskMetric] =
+  Array(taskMetric(NUM_DELETED_ROWS_SKIPPED, numDeletedRowsSkipped))
+```
+
+| Metric | Description (UI) | Kind | Same as V1 |
+| :--- | :--- | :--- | :--- |
+| `numFiles` | number of files read | driver, sum | yes |
+| `filesSize` | size of files read | driver, shown as bytes | yes |
+| `numPartitions` | number of partitions read | driver, sum | yes |
+| `numDeletedRowsSkipped` | number of rows skipped by deletion vectors | task, sum | new |
+
+- **(a) After runtime filtering.** `BatchScanExec.inputRDD` calls `reportDriverMetrics()` after
+  it has applied the runtime filters (6.7), so the values describe the files actually read.
+- **(b) Distinct files.** A file read in several byte ranges (6.8) is counted once, by path, and
+  its size is its whole size, like V1.
+- **(c) Partitions** are counted by distinct partition values (all partition columns), which is
+  what V1 counts as partition directories.
+- **(d) Task metric.** The row reader counts the rows it skips because their DV marks them as
+  deleted. Spark collects it from each reader and sums it. Columnar scans never read DV files
+  (6.9.1 b), so they don't report it.
+- Spark creates the UI metrics from `supportedCustomMetrics()` and later instantiates the metric
+  classes by name to format the values, so they are top-level classes with no-arg
+  constructors. `DeltaScanFilesSizeMetric` formats with `Utils.bytesToString`.
+
 ---
 
 ## 7. Design Details & Invariants
@@ -1543,14 +1589,14 @@ row tracking formula as V1 (6.6), and every `_metadata` test compares V2 output 
 - **Runtime filtering on partition columns only:** dynamic partition pruning prunes by partition
   values (6.7), as in V1. Data columns are not offered as runtime filter columns, so file
   statistics are not used to skip files at runtime.
-- **No V1 file-scan metrics:** metrics such as "number of files read" don't show up the way they
-  do for `FileSourceScanExec`.
+- **Fewer scan metrics than V1:** the V2 scan reports V1's file metrics (6.10), but not V1's
+  timing metrics (`metadataTime`, `pruningTime`).
 
 ---
 
 ## 10. Test Suite
 
-`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 61
+`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 63
 tests.
 
 **Setup (`withSPJConf`):** turns on both SPJ confs, `pushPartValues=true`,
@@ -1624,8 +1670,10 @@ deterministic.
 | 57 | Dynamic partition pruning on a scan with split partitions | Star join where the fact partitions are split into several input partitions; DPP with and without broadcast reads 2 files and keeps Spark's per-key rule (6.7.3 e). |
 | 58 | Scans return columnar batches when the V1 scan would | Partition column in the middle, column mapping with a renamed column, DATE / DECIMAL / ARRAY / STRUCT / MAP columns, two files per partition: SPJ joins, a scan without SPJ, a partition-column-only and a column-less `count(*)` scan are columnar and equal V1; with nested vectorized reads off, only atomic reads are columnar (6.9). |
 | 59 | Scans return rows when columnar batches can't be used | Vectorized reader off, whole-stage codegen off, too many fields, and the kill switch each give rows and equal V1; `_metadata` reads are row-based; a DV table is columnar until a DELETE writes a DV (6.9.1 b). |
-| 60 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
-| 61 | SPJ with tables containing NULL partition values | NULL keys. |
+| 60 | V2 scan reports file metrics like V1 | `numFiles`, `filesSize`, `numPartitions` equal V1's for an SPJ join, a join with a partition filter, and a scan without SPJ; exact values (6 files, table size, 3 partitions); split files count once (6.10). |
+| 61 | V2 scan metrics after dynamic partition pruning and with Deletion Vectors | After DPP the fact scan reports 2 files and 2 partitions (6.10 a); `numDeletedRowsSkipped` counts the 2 rows removed by a DV (6.10 d). |
+| 62 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
+| 63 | SPJ with tables containing NULL partition values | NULL keys. |
 
 The `_metadata` tests use `checkMatchesV1(query, expectV2)`: it runs the query with the feature
 off and on, checks the rows are equal, and checks whether the plan with the feature on has a V2
@@ -1687,4 +1735,5 @@ Changes made while preparing the PR, and why:
 | File packing and splitting for scans without SPJ (6.8) | **Performance regression.** V1 packs small files and splits large ones; the V2 scan used one task per whole file, which is slow for tables with many small files or a few large ones. Reuses Spark's `FilePartition` code and V1's splittability rule. |
 | Split large key groups for SPJ scans (6.8.2) | **Skew.** With SPJ each key was one task reading whole files, so one large partition made one long task. Spark 4.2 accepts several input partitions per key and can spread them with partially clustered distribution. DPP now removes files from the planned splits so the number of splits per key never grows. |
 | Columnar reads (6.9) | **Performance regression.** V1 hands Parquet batches to whole-stage codegen; the V2 scan turned them into rows and projected each one. Uses V1's rule for when to return batches, and only reorders the batch's column vectors. Most existing tests now run columnar, so they cover it too. |
+| Scan metrics (6.10) | **Observability regression.** V1 shows files, bytes and partitions read; the V2 `BatchScan` only showed output rows. Same names and descriptions as V1, plus rows skipped by DVs. |
 | Test cleanup and new tests 6–10, 15 | Line length and style, plus coverage for type parsing, column order, time travel, DML, and the conf guard. |

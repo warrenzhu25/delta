@@ -40,6 +40,7 @@ import org.apache.spark.sql.catalyst.expressions.{Add, And, BindReferences, Boun
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.connector.expressions.{Expression => V2Expression, Expressions, FieldReference, NamedReference}
 import org.apache.spark.sql.connector.expressions.filter.{Predicate => V2Predicate}
+import org.apache.spark.sql.connector.metric.{CustomMetric, CustomSumMetric, CustomTaskMetric}
 import org.apache.spark.sql.connector.read._
 import org.apache.spark.sql.connector.read.partitioning.{KeyGroupedPartitioning, Partitioning, UnknownPartitioning}
 import org.apache.spark.sql.execution.WholeStageCodegenExec
@@ -50,7 +51,7 @@ import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.{DataType, LongType, StructField, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.sql.vectorized.ColumnarBatch
-import org.apache.spark.util.SerializableConfiguration
+import org.apache.spark.util.{SerializableConfiguration, Utils}
 
 /**
  * ScanBuilder for Delta DataSource V2 reader with Storage-Partitioned Join (SPJ) support.
@@ -347,6 +348,26 @@ class DeltaBatchScan(
   }
 
   override def estimateStatistics(): Statistics = scanStatistics
+
+  override def supportedCustomMetrics(): Array[CustomMetric] = DeltaScanMetrics.supportedMetrics
+
+  /**
+   * Reports the files the scan reads, like the V1 file scan's `numFiles`, `filesSize` and
+   * `numPartitions` metrics. Spark calls this after runtime filtering, so the values reflect the
+   * files left by dynamic partition pruning. A file read in several byte ranges counts once.
+   */
+  override def reportDriverMetrics(): Array[CustomTaskMetric] = {
+    val files = planInputPartitions().iterator
+      .flatMap(_.asInstanceOf[DeltaKeyGroupedInputPartition].files.iterator)
+      .map(f => f.path -> f)
+      .toMap
+      .values
+    Array(
+      DeltaScanMetrics.taskMetric(DeltaScanMetrics.NUM_FILES, files.size.toLong),
+      DeltaScanMetrics.taskMetric(DeltaScanMetrics.FILES_SIZE, files.iterator.map(_.size).sum),
+      DeltaScanMetrics.taskMetric(DeltaScanMetrics.NUM_PARTITIONS,
+        files.iterator.map(_.partitionValues).toSet.size.toLong))
+  }
 
   private def extractPartitionRow(
       partValuesMap: Map[String, String],
@@ -849,6 +870,7 @@ class DeltaBatchPartitionReader(
   private val fileIterator: Iterator[DeltaScanFileInfo] = partition.files.iterator
   private var currentFileReader: Option[Iterator[InternalRow]] = None
   private var currentRow: InternalRow = _
+  private var numDeletedRowsSkipped: Long = 0L
   private val joinedRow = new JoinedRow()
   private var constantMetadataRow: InternalRow = InternalRow.empty
 
@@ -883,12 +905,17 @@ class DeltaBatchPartitionReader(
       if (!isRowDeleted(row)) {
         currentRow = projection(joinedRow(row, constantMetadataRow))
         found = true
+      } else {
+        numDeletedRowsSkipped += 1
       }
     }
     found
   }
 
   override def get(): InternalRow = currentRow
+
+  override def currentMetricsValues(): Array[CustomTaskMetric] = Array(
+    DeltaScanMetrics.taskMetric(DeltaScanMetrics.NUM_DELETED_ROWS_SKIPPED, numDeletedRowsSkipped))
 
   override def close(): Unit = {
     closeCurrentFileReader()
@@ -946,4 +973,50 @@ class DeltaColumnarPartitionReader(
   override def close(): Unit = {
     closeCurrentFileReader()
   }
+}
+
+/**
+ * Custom metrics of [[DeltaBatchScan]], shown on the `BatchScan` node in the SQL UI. The driver
+ * metrics have the same names and descriptions as the V1 file scan's. Spark instantiates the
+ * metric classes by name to aggregate values, so they are top-level classes with no-arg
+ * constructors.
+ */
+object DeltaScanMetrics {
+  val NUM_FILES = "numFiles"
+  val FILES_SIZE = "filesSize"
+  val NUM_PARTITIONS = "numPartitions"
+  val NUM_DELETED_ROWS_SKIPPED = "numDeletedRowsSkipped"
+
+  def supportedMetrics: Array[CustomMetric] = Array(
+    new DeltaScanNumFilesMetric,
+    new DeltaScanFilesSizeMetric,
+    new DeltaScanNumPartitionsMetric,
+    new DeltaScanNumDeletedRowsSkippedMetric)
+
+  def taskMetric(metricName: String, metricValue: Long): CustomTaskMetric = new CustomTaskMetric {
+    override def name(): String = metricName
+    override def value(): Long = metricValue
+  }
+}
+
+class DeltaScanNumFilesMetric extends CustomSumMetric {
+  override def name(): String = DeltaScanMetrics.NUM_FILES
+  override def description(): String = "number of files read"
+}
+
+class DeltaScanFilesSizeMetric extends CustomMetric {
+  override def name(): String = DeltaScanMetrics.FILES_SIZE
+  override def description(): String = "size of files read"
+  override def aggregateTaskMetrics(taskMetrics: Array[Long]): String =
+    Utils.bytesToString(taskMetrics.sum)
+}
+
+class DeltaScanNumPartitionsMetric extends CustomSumMetric {
+  override def name(): String = DeltaScanMetrics.NUM_PARTITIONS
+  override def description(): String = "number of partitions read"
+}
+
+class DeltaScanNumDeletedRowsSkippedMetric extends CustomSumMetric {
+  override def name(): String = DeltaScanMetrics.NUM_DELETED_ROWS_SKIPPED
+  override def description(): String = "number of rows skipped by deletion vectors"
 }
