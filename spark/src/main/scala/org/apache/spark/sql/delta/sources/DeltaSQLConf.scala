@@ -284,8 +284,10 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .internal()
       .doc("When true, the Storage-Partitioned Join V2 scan splits large files and packs small " +
         "files into input partitions like the V1 file scan (spark.sql.files.maxPartitionBytes, " +
-        "spark.sql.files.openCostInBytes). When false, every file is read whole, in its own " +
-        "input partition, or in its partition key's input partition for SPJ.")
+        "spark.sql.files.openCostInBytes). With SPJ this is done within each partition key, so " +
+        "a large partition key can have several input partitions. When false, every file is " +
+        "read whole, in its own input partition, or in its partition key's input partition " +
+        "for SPJ.")
       .booleanConf
       .createWithDefault(true)
 

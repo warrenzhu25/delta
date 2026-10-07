@@ -107,8 +107,8 @@ have to sort its partitions.
 | `spark/src/main/scala/org/apache/spark/sql/delta/catalog/DeltaTableV2.scala` | `with SupportsRead`, `newScanBuilder`; `with SupportsMetadataColumns`, `metadataColumns` (6.6.1) | +30 / -2 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/DeltaAnalysis.scala` | V2 → V1 conversion keeps `_metadata` references valid (6.6.5) | +93 / -7 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/files/TahoeFileIndex.scala` | Per-file constant metadata (row tracking, DV descriptor) moved into a reusable `TahoeFileIndex.constantMetadataForFile` | +30 / -17 |
-| `spark/src/main/scala/org/apache/spark/sql/delta/v2/DeltaScanBuilder.scala` | **New.** Scan builder, scan (with statistics and runtime filtering), input partition, reader factory (with `_metadata`), reader (with DV filtering), file packing and splitting | ~840 |
-| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 57 tests | ~1245 |
+| `spark/src/main/scala/org/apache/spark/sql/delta/v2/DeltaScanBuilder.scala` | **New.** Scan builder, scan (with statistics and runtime filtering), input partition, reader factory (with `_metadata`), reader (with DV filtering), file packing and splitting (also within SPJ key groups) | ~845 |
+| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 59 tests | ~1320 |
 
 No other code paths change when the conf is `false`. The only extra work is two conf lookups per
 Delta relation during analysis (plus two more when Spark asks a Delta table for its metadata
@@ -407,18 +407,24 @@ private lazy val hasDeletionVectors: Boolean =
 private lazy val originalPartitions: Array[InputPartition] = planPartitionsFor(selectedFiles)
 
 private def planPartitionsFor(files: Seq[AddFile]): Array[InputPartition] = {
-  // (c) Group files by partition key
-  if (isSPJEligible) {
+  // (c) Group files by partition key, then split + pack each group (6.8)
+  val keyedGroups: Seq[(InternalRow, Seq[DeltaScanFileInfo])] = if (isSPJEligible) {
     val projectedPhysicalCols = projectedPartitionFields.map(DeltaColumnMapping.getPhysicalName)
-    val grouped = files.groupBy { f =>
+    files.groupBy { f =>
       projectedPhysicalCols.map(col => col -> f.partitionValues.getOrElse(col, null)).toMap
-    }.toSeq
-    planPartitions(grouped)
-  } else if (fileSplittingEnabled) {
-    packFiles(files)                                                // split + pack like V1, 6.8
+    }.values.toSeq.flatMap { groupFiles =>
+      val key = extractPartitionRow(groupFiles.head.partitionValues, projectedPartitionFields)
+      if (fileSplittingEnabled) packFiles(groupFiles).map(key -> _)   // may give several splits
+      else Seq(key -> groupFiles.map(wholeFile))                      // one split per key
+    }
   } else {
-    planPartitions(files.map(f => (f.partitionValues, Seq(f))))   // one split per file
+    val noKey = new GenericInternalRow(0)
+    if (fileSplittingEnabled) packFiles(files).map(noKey -> _)
+    else files.map(f => noKey -> Seq(wholeFile(f)))                   // one split per file
   }
+  keyedGroups.zipWithIndex.map { case ((key, fileInfos), idx) =>      // (d) 6.4.5
+    DeltaKeyGroupedInputPartition(idx, fileInfos.toArray, key): InputPartition
+  }.toArray
 }
 ```
 
@@ -432,14 +438,18 @@ private def planPartitionsFor(files: Seq[AddFile]): Array[InputPartition] = {
   ends up with exactly one input partition per side.
 - **(c)** The grouping key is a map of physical column name to raw string value, built from the
   *projected* partition columns only. Files from different full partitions (`US/CA`, `US/NY`)
-  share a group when only `region` is projected. When SPJ doesn't apply, files are split and
-  packed like V1 (6.8), or, with the kill switch off, get one split each.
+  share a group when only `region` is projected. Each group is then split and packed like V1
+  (6.8), so a large key group can become several input partitions *with the same key* (6.8.2).
+  When SPJ doesn't apply, all files are split and packed together and get an empty key. With the
+  kill switch off (`fileSplitting.enabled = false`), each key group is one input partition (SPJ)
+  or each file is (no SPJ).
+- **(d)** Input partitions get sequential ids. The key and the byte ranges are built in 6.4.5.
 - `selectedFiles` and `originalPartitions` are `lazy val`s, so the Delta log is scanned once per
   scan, even though Spark calls `estimateStatistics()`, `outputPartitioning()`,
   `planInputPartitions()` and `createReaderFactory()`.
 - `selectedFiles` is separate from the grouping so that statistics (6.4.6a) and
-  `hasDeletionVectors` (6.5) use the same pruned file list. Runtime filtering (6.7) regroups a
-  subset of these files with the same `planPartitionsFor`, and doesn't change either.
+  `hasDeletionVectors` (6.5) use the same pruned file list. Runtime filtering (6.7) removes files
+  from these input partitions, and doesn't change either.
 
 #### 6.4.4 Turning partition strings into typed rows
 
@@ -464,25 +474,23 @@ private def extractPartitionRow(partValuesMap: Map[String, String],
 #### 6.4.5 Building input partitions
 
 ```scala
-private def planPartitions(groups: Seq[(Map[String, String], Seq[AddFile])]): Array[InputPartition] =
-  groups.zipWithIndex.map { case ((_, files), idx) =>
-    val groupingKeyRow = extractPartitionRow(files.head.partitionValues, projectedPartitionFields)
-    val fileInfos = files.map { f =>
-      toFileInfo(f,                                              // whole file: [0, size)
-        partitionValues = extractPartitionRow(f.partitionValues, metadata.partitionSchema),
-        constantMetadata = TahoeFileIndex.constantMetadataForFile(f, rowIndexFilters = None),
-        start = 0L, length = f.size)
-    }.toArray
-    DeltaKeyGroupedInputPartition(idx, fileInfos, groupingKeyRow): InputPartition
-  }.toArray
+// The key of an SPJ group: projected partition columns only
+val key = extractPartitionRow(groupFiles.head.partitionValues, projectedPartitionFields)
+
+// The whole file `f` as one byte range (kill switch off, or a file that can't be split)
+private def wholeFile(f: AddFile): DeltaScanFileInfo = toFileInfo(f,
+  partitionValues = extractPartitionRow(f.partitionValues, metadata.partitionSchema),
+  constantMetadata = TahoeFileIndex.constantMetadataForFile(f, rowIndexFilters = None),
+  start = 0L, length = f.size)
 
 // `toFileInfo` fills DeltaScanFileInfo(path = resolveFilePath(f.path), start, length,
 // size = f.size, modificationTime = f.modificationTime, partitionValues, constantMetadata)
+// `splitFile` (6.8) builds the same values for each byte range of a file.
 ```
 
-- **Two rows per file group** (see 7.2):
-  - `groupingKeyRow` has the *projected* partition columns only. It is the key Spark matches on.
-    All files in a group have the same values for these columns, so `files.head` is enough.
+- **Two rows per input partition** (see 7.2):
+  - The key has the *projected* partition columns only. It is the key Spark matches on. All
+    files in a group have the same values for these columns, so `groupFiles.head` is enough.
   - Each file's `partitionValues` row has *all* partition columns, which the Parquet reader needs.
 - **`resolveFilePath`:** `AddFile.path` is usually relative (URL-encoded, e.g. `part=a/x.parquet`).
   It is parsed as a URI and made absolute against `deltaLog.dataPath`, just like
@@ -511,7 +519,9 @@ private lazy val reportedPartitioning: Partitioning =
 
 - Computed once and logged once, using Delta's structured logging (`log"..."` with `MDC`).
 - `numPartitions` must equal the length of `planInputPartitions()` at planning time. Both come
-  from `originalPartitions`. After dynamic partition pruning, `planInputPartitions()` can return
+  from `originalPartitions`. Spark builds its own partitioning from the keys of the input
+  partitions (`KeyedPartitioning`, 6.8.2), so the number counts every split, including several
+  splits of the same key. After dynamic partition pruning, `planInputPartitions()` can return
   fewer partitions; Spark expects that and doesn't re-check the reported number (6.7).
 
 #### 6.4.6a Reporting statistics
@@ -1168,9 +1178,10 @@ read every partition of the fact table.
    filter into a V2 predicate, `IN(FieldReference(key), LiteralValue(v1), ...)`, calls
    `scan.filter(predicates)` and then `scan.toBatch.planInputPartitions()` **again**.
 3. **Key-grouped scans.** When the scan reported `KeyGroupedPartitioning`, Spark requires every new
-   partition to be `HasPartitionKey` and the new keys to be a subset of the original keys. It then
-   pads the missing keys with empty partitions, so the join stays shuffle-free and lines up with
-   the other side exactly as planned.
+   partition to be `HasPartitionKey`, the new keys to be a subset of the original keys, and, for
+   every key, no more input partitions than before (a key can have several, 6.8.2). It then pads
+   the missing partitions with empty ones, so the join stays shuffle-free and lines up with the
+   other side exactly as planned.
 
 #### 6.7.2 `filterAttributes`
 
@@ -1189,7 +1200,6 @@ override def filterAttributes(): Array[NamedReference] =
 #### 6.7.3 `filter`
 
 ```scala
-@volatile private var runtimeFilteredFiles: Option[Seq[AddFile]] = None
 @volatile private var runtimeFilteredPartitions: Option[Array[InputPartition]] = None
 
 override def filter(predicates: Array[V2Predicate]): Unit = {
@@ -1206,13 +1216,13 @@ override def filter(predicates: Array[V2Predicate]): Unit = {
   if (partitionFilters.nonEmpty) {
     val keep = Predicate.createInterpreted(
       BindReferences.bindReference(partitionFilters.reduce(And), partitionAttrs))
-    val files = runtimeFilteredFiles.getOrElse(selectedFiles)                // (c)
-    val remainingFiles = files.filter { f =>
-      keep.eval(extractPartitionRow(f.partitionValues, metadata.partitionSchema))   // (d)
+    val partitions = planInputPartitions().map(_.asInstanceOf[DeltaKeyGroupedInputPartition]) // (c)
+    val remaining = partitions.flatMap { p =>
+      val files = p.files.filter(f => keep.eval(f.partitionValues))          // (d)
+      if (files.isEmpty) None else Some(p.copy(files = files))               // (e)
     }
-    logInfo(...)   // "Runtime filtering kept N of M files for table T"
-    runtimeFilteredFiles = Some(remainingFiles)
-    runtimeFilteredPartitions = Some(planPartitionsFor(remainingFiles))      // (e)
+    logInfo(...)   // "Runtime filtering kept N of M files for table T" (distinct paths)
+    runtimeFilteredPartitions = Some(remaining.map(p => p: InputPartition))
   }
 }
 ```
@@ -1224,22 +1234,27 @@ override def filter(predicates: Array[V2Predicate]): Unit = {
 - **(b) Resolution.** Attributes are resolved against the **partition schema only**, with the
   session resolver (case-insensitive by default). Anything that references another column stays
   unresolved and is dropped.
-- **(c) Repeated calls.** Filters are applied on top of earlier runtime filters, so several DPP
-  filters on one scan (for example from two dimension tables) combine with AND.
-- **(d) Evaluation.** Each file's partition values are parsed with `extractPartitionRow` (6.4.4),
-  the same typed parsing V1 uses, so Date / Timestamp / numeric keys and column mapping (physical
-  names) behave the same as in V1. The key Spark sends is already of the column's type.
-- **(e) Regrouping.** The remaining files are grouped with the same `planPartitionsFor` as
-  `originalPartitions` (6.4.3). Since the files are a subset, the keys are a subset of the
-  original keys, which is what Spark requires (6.7.1, step 3). For `UnknownPartitioning` scans
-  this is simply one split per remaining file.
+- **(c) Repeated calls.** Filtering starts from the current `planInputPartitions()`, which already
+  has earlier runtime filters applied, so several DPP filters on one scan (for example from two
+  dimension tables) combine with AND.
+- **(d) Evaluation.** Each file's `partitionValues` row already holds all partition columns,
+  parsed with `extractPartitionRow` (6.4.4), the same typed parsing V1 uses, so Date / Timestamp /
+  numeric keys and column mapping (physical names) behave the same as in V1. The key Spark sends
+  is already of the column's type. All byte ranges of one file have the same values, so a file is
+  kept or dropped as a whole.
+- **(e) No regrouping.** Files are removed from the input partitions they were planned in, and
+  input partitions left empty are dropped. The files are *not* grouped, split or packed again:
+  for a scan that reports `KeyGroupedPartitioning`, Spark requires the new keys to be a subset of
+  the original ones **and** the number of input partitions per key not to grow (6.7.1, step 3).
+  Planning again could break the second rule when a key has several splits (6.8.2), because
+  `maxSplitBytes` depends on the total size of the files. Pruned partitions stay a bit smaller
+  than they could be, which only matters when most of the files of a partition are pruned.
 - **What does not change:** `reportedPartitioning` (the plan is already fixed),
   `estimateStatistics()` (planning is over) and `hasDeletionVectors` (computed from all selected
   files, so the reader is still set up for DVs if any remaining file has one; a scan with no DV
   files left just carries an unused DV column).
 - **Thread safety:** `filter` and `planInputPartitions` are called from the driver, but possibly
-  from different threads during AQE; the two fields are `@volatile` and each is written once per
-  `filter` call.
+  from different threads during AQE; the field is `@volatile` and written once per `filter` call.
 
 #### 6.7.4 When Spark plans DPP
 
@@ -1258,12 +1273,14 @@ These are Spark's rules, not Delta's, but they decide whether the code above run
 
 ### 6.8 File packing and splitting
 
-Without SPJ (the query reads no partition column, so the scan reports `UnknownPartitioning`), the
-scan used to create one input partition per file, and read every file whole. Tables with many
-small files then got one task per file, and a table with a few huge files got only a few long
-tasks. V1's `FileSourceScanExec` avoids both by splitting large files into byte ranges and
-packing small ones together. The V2 scan now does the same, with the same settings and the same
-Spark code.
+The scan used to read every file whole: one input partition per file without SPJ, and one per
+key with SPJ. Tables with many small files then got one task per file, a table with a few huge
+files got only a few long tasks, and with SPJ one large partition (a skewed key) made one task
+that ran much longer than the rest. V1's `FileSourceScanExec` avoids the first two by splitting
+large files into byte ranges and packing small ones together. The V2 scan now does the same, with
+the same settings and the same Spark code, and with SPJ it does so inside each key group.
+
+#### 6.8.1 Splitting and packing
 
 ```scala
 private lazy val isSplittable: Boolean = !(hasDeletionVectors && !useMetadataRowIndex)   // (a)
@@ -1288,7 +1305,7 @@ private def splitFile(f: AddFile): Seq[DeltaScanFileInfo] = {                   
   }
 }
 
-private def packFiles(files: Seq[AddFile]): Array[InputPartition] = {                     // (d)
+private def packFiles(files: Seq[AddFile]): Seq[Seq[DeltaScanFileInfo]] = {               // (d)
   val splits = files.flatMap(splitFile).sortBy(_.length)(Ordering[Long].reverse)
   val infoBySplit = new java.util.IdentityHashMap[PartitionedFile, DeltaScanFileInfo]()
   val partitionedFiles = splits.map { info =>
@@ -1297,9 +1314,8 @@ private def packFiles(files: Seq[AddFile]): Array[InputPartition] = {           
     partitionedFile
   }
   FilePartition.getFilePartitions(spark, partitionedFiles, maxSplitBytes).map { p =>
-    DeltaKeyGroupedInputPartition(p.index, p.files.map(infoBySplit.get),
-      partitionKeyInternalRow = new GenericInternalRow(0)): InputPartition
-  }.toArray
+    p.files.toSeq.map(infoBySplit.get)
+  }
 }
 ```
 
@@ -1314,7 +1330,8 @@ private def packFiles(files: Seq[AddFile]): Array[InputPartition] = {           
   `min(spark.sql.files.maxPartitionBytes, max(spark.sql.files.openCostInBytes, bytesPerCore))`,
   where `bytesPerCore` divides the selected bytes (each file counted with the open cost) by
   `spark.sql.files.minPartitionNum` (default: the default parallelism). Small scans thus still
-  use all cores.
+  use all cores. It is computed once from all selected files, so every key group uses the same
+  split size.
 - **(c) Splitting.** Same as `PartitionedFileUtil.splitFiles`: consecutive `maxSplitBytes`
   ranges. A Parquet reader given a range reads the row groups whose midpoint falls into it, so
   every row group is read by exactly one piece; pieces without a midpoint return no rows.
@@ -1322,14 +1339,39 @@ private def packFiles(files: Seq[AddFile]): Array[InputPartition] = {           
   `FilePartition.getFilePartitions`, which packs them with "next fit decreasing", counting
   `openCostInBytes` per piece and rescaling when there would be more than
   `spark.sql.files.maxPartitionNum` partitions. Spark returns `PartitionedFile`s; the identity
-  map turns them back into the `DeltaScanFileInfo`s they were built from.
-- **No partition key.** A packed partition can hold files from several partitions. Its key is
-  empty, which is fine because the scan reports `UnknownPartitioning` and Spark doesn't look at
-  keys then. Each file's own partition values are still in `DeltaScanFileInfo.partitionValues`.
-- **Runtime filtering doesn't apply** to these scans: DPP only filters by partition columns in
-  `readSchema` (6.7.2), and a scan without SPJ has none.
+  map turns them back into the `DeltaScanFileInfo`s they were built from. `planPartitionsFor`
+  (6.4.3) adds the key and the partition id.
+- **Without SPJ** all files are packed together, so a packed partition can hold files from
+  several partitions. Its key is empty, which is fine because the scan reports
+  `UnknownPartitioning` and Spark doesn't look at keys then. Each file's own partition values are
+  still in `DeltaScanFileInfo.partitionValues`. Runtime filtering doesn't apply to these scans:
+  DPP only filters by partition columns in `readSchema` (6.7.2), and a scan without SPJ has none.
+
+#### 6.8.2 SPJ scans: several input partitions per key
+
+With SPJ, `packFiles` runs once per key group (6.4.3), so files of different keys are never
+mixed, and a key whose files are larger than `maxSplitBytes` becomes several input partitions,
+all reporting the same key. Small keys still get one input partition each. `maxPartitionNum` is
+applied per key group.
+
+Spark (4.2) supports this directly. `BatchScanExec` builds its output partitioning from the keys
+of the input partitions (`KeyedPartitioning`); when a key appears more than once, the
+partitioning is *not grouped*. `EnsureRequirements` then decides per operator:
+
+| Case | What Spark does | Effect |
+| :--- | :--- | :--- |
+| Join, `v2.bucketing.partiallyClusteredDistribution.enabled=false` (default) | Adds `GroupPartitionsExec`, which merges the splits of each key into one task | Same tasks as before: still no shuffle, and correct; the splits are just read one after another |
+| Join, `partiallyClusteredDistribution.enabled=true`, join type allows it | Keeps the splits of the larger side and replicates the matching partition of the other side for each split | A skewed key is processed by several tasks, still without a shuffle |
+| Aggregation / window on the partition columns | Adds `GroupPartitionsExec` when it needs all rows of a key in one task | Same as before |
+| Scan not used by SPJ | Nothing | The splits run as separate tasks, like V1 |
+
+- **Correctness.** Each split is a whole number of row groups of one file (6.8.1 c), and every
+  split carries its file's partition values, DV descriptor and `_metadata` constants, so splits
+  return exactly the rows of the whole file, in any combination.
+- **Runtime filtering.** DPP removes files from the planned splits instead of planning again
+  (6.7.3 e), so the number of splits per key can only go down, as Spark requires.
 - **Kill switch:** `storagePartitionedJoin.fileSplitting.enabled=false` (6.1) goes back to one
-  whole-file split per input partition.
+  whole-file input partition per key (SPJ) or per file (no SPJ).
 
 ---
 
@@ -1394,7 +1436,7 @@ row tracking formula as V1 (6.6), and every `_metadata` test compares V2 output 
 | CDC read (`readChangeFeed`) | V1 | No |
 | DML target (UPDATE/DELETE/MERGE) | V1 (existing `DeltaRelation` handling; `_metadata` references remapped, 6.6.5) | No |
 | Partitioned table, query reads no partition column | V2, `UnknownPartitioning`, files split and packed like V1 (6.8) | No |
-| Partitioned table, both join sides key-grouped on compatible keys | V2, `KeyGroupedPartitioning` | **Yes** |
+| Partitioned table, both join sides key-grouped on compatible keys | V2, `KeyGroupedPartitioning`; large keys split into several input partitions (6.8.2) | **Yes** |
 | One side V2 key-grouped, other side V1 or incompatible | V2 + V1 | No (Spark shuffles) |
 | Join on a partition column with a selective other side (DPP) | V2, pruned at runtime to the matching partitions (6.7) | Unchanged (Yes if the join is SPJ) |
 
@@ -1404,9 +1446,9 @@ row tracking formula as V1 (6.6), and every `_metadata` test compares V2 output 
 
 - **DML filtering on the target's `_metadata`:** not supported, as in V1; the same error is
   raised with the feature on (6.6.5).
-- **No file splitting with SPJ:** with `KeyGroupedPartitioning`, each key group is one task and
-  its files are read whole, so skewed or very large partitions get less parallelism. Scans
-  without SPJ split and pack files like V1 (6.8).
+- **Skewed keys need partial clustering:** large key groups are split (6.8.2), but Spark merges
+  the splits of a key back into one task unless `partiallyClusteredDistribution.enabled` is on
+  and the join type allows it, or the operator doesn't need the key grouped.
 - **Row-based reads only:** `columnarSupportMode = UNSUPPORTED`. The Parquet reader may decode
   vectorized internally, but rows are handed to Spark one at a time.
 - **CDC:** always V1.
@@ -1424,7 +1466,7 @@ row tracking formula as V1 (6.6), and every `_metadata` test compares V2 output 
 
 ## 10. Test Suite
 
-`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 57
+`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 59
 tests.
 
 **Setup (`withSPJConf`):** turns on both SPJ confs, `pushPartValues=true`,
@@ -1494,8 +1536,10 @@ deterministic.
 | 52 | Scans without SPJ pack small files into input partitions | 8 small files in one input partition (open cost 1 byte, `minPartitionNum=1`); one per file with the kill switch off (6.8). |
 | 53 | Scans without SPJ split large files | Files with many small row groups and `maxPartitionBytes=64KB`: several pieces per file that cover it exactly once; rows, `count`/`sum` and `_metadata.file_block_start`/`file_block_length` equal V1. |
 | 54–55 | Scans without SPJ split Deletion Vector files only with the metadata row index (`useMetadataRowIndex` true / false) | DV files split with the metadata row index, read whole without it (6.8 a); rows and `_metadata.row_index` equal V1. |
-| 56 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
-| 57 | SPJ with tables containing NULL partition values | NULL keys. |
+| 56 | SPJ splits large partitions into several input partitions with the same key | A skewed table (one large partition with many small row groups, one small partition) and `maxPartitionBytes=64KB`: the large key has several input partitions; join, left join and aggregation equal V1 and stay shuffle-free with `partiallyClusteredDistribution` off and on; one input partition per key with the kill switch off (6.8.2). |
+| 57 | Dynamic partition pruning on a scan with split partitions | Star join where the fact partitions are split into several input partitions; DPP with and without broadcast reads 2 files and keeps Spark's per-key rule (6.7.3 e). |
+| 58 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
+| 59 | SPJ with tables containing NULL partition values | NULL keys. |
 
 The `_metadata` tests use `checkMatchesV1(query, expectV2)`: it runs the query with the feature
 off and on, checks the rows are equal, and checks whether the plan with the feature on has a V2
@@ -1555,4 +1599,5 @@ Changes made while preparing the PR, and why:
 | Materialized row tracking columns keep the generated field's metadata (6.6.2 b) | Needed for `DeltaParquetFileFormat` to treat them as internal columns under column mapping, as V1 does. |
 | Dynamic partition pruning (6.7) | **Planning regression.** V1 scans are pruned by DPP; without `SupportsRuntimeV2Filtering`, turning the feature on made star joins read the whole fact table. Implemented on partition values with V1's parsing, and regrouped so the keys stay a subset, as Spark requires for key-grouped scans. |
 | File packing and splitting for scans without SPJ (6.8) | **Performance regression.** V1 packs small files and splits large ones; the V2 scan used one task per whole file, which is slow for tables with many small files or a few large ones. Reuses Spark's `FilePartition` code and V1's splittability rule. |
+| Split large key groups for SPJ scans (6.8.2) | **Skew.** With SPJ each key was one task reading whole files, so one large partition made one long task. Spark 4.2 accepts several input partitions per key and can spread them with partially clustered distribution. DPP now removes files from the planned splits so the number of splits per key never grows. |
 | Test cleanup and new tests 6–10, 15 | Line length and style, plus coverage for type parsing, column order, time travel, DML, and the conf guard. |

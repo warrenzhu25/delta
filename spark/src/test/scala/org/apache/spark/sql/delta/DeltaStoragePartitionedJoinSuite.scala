@@ -968,10 +968,13 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
     }
   }
 
-  /** Number of files `scan` planned to read; after execution this reflects runtime filtering. */
+  /**
+   * Number of distinct files `scan` planned to read (a file may be split into several byte
+   * ranges); after execution this reflects runtime filtering.
+   */
   private def numPlannedFiles(scan: BatchScanExec): Int =
     scan.scan.asInstanceOf[DeltaBatchScan].planInputPartitions()
-      .map(_.asInstanceOf[DeltaKeyGroupedInputPartition].files.length).sum
+      .flatMap(_.asInstanceOf[DeltaKeyGroupedInputPartition].files.map(_.path)).distinct.length
 
   /**
    * Checks that `query` returns the same rows with DPP on the V2 scan as with V1, and that one V2
@@ -1200,6 +1203,77 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
               }
             }
           }
+        }
+      }
+    }
+  }
+
+  /** Keys of the input partitions planned by the V2 scan of `table` in `df`. */
+  private def plannedKeys(df: DataFrame, table: String): Seq[String] = {
+    val scan = batchScans(df.queryExecution.executedPlan)
+      .find(_.scan.description().contains(table)).get
+    scan.scan.asInstanceOf[DeltaBatchScan].planInputPartitions().toSeq
+      .map(_.asInstanceOf[DeltaKeyGroupedInputPartition].partitionKey().getUTF8String(0).toString)
+  }
+
+  /** `t_skew`: a large partition p0 (one file, many row groups) and a small partition p1. */
+  private def createSkewedTable(): Unit = {
+    sql("CREATE TABLE t_skew (id INT, v STRING, part STRING) USING delta PARTITIONED BY (part)")
+    withSQLConf("parquet.block.size" -> "4096", "parquet.page.size" -> "1024") {
+      sql("INSERT INTO t_skew SELECT /*+ REPARTITION(1) */ CAST(id AS INT), " +
+        "md5(CAST(id AS STRING)), 'p0' FROM range(20000)")
+    }
+    insertValues("t_skew", "(-1, 'a', 'p1'), (-2, 'b', 'p1')")
+  }
+
+  private def withSmallSplits[T](f: => T): T = withSQLConf(
+    SQLConf.FILES_MAX_PARTITION_BYTES.key -> "65536",
+    SQLConf.FILES_MIN_PARTITION_NUM.key -> "1")(f)
+
+  test("SPJ splits large partitions into several input partitions with the same key") {
+    withTable("t_skew", "t_small") {
+      createSkewedTable()
+      sql("CREATE TABLE t_small (id INT, w STRING, part STRING) USING delta " +
+        "PARTITIONED BY (part)")
+      insertValues("t_small", "(1, 'x', 'p0'), (2, 'y', 'p1'), (3, 'z', 'p2')")
+      val join = "SELECT s.id, s.v, t.w, s.part FROM t_skew s JOIN t_small t ON s.part = t.part"
+      val leftJoin = join.replace(" JOIN ", " LEFT JOIN ")
+      val agg = "SELECT part, count(*), sum(id) FROM t_skew GROUP BY part"
+      withSmallSplits {
+        for (partiallyClustered <- Seq(false, true)) {
+          withSQLConf(SQLConf.V2_BUCKETING_PARTIALLY_CLUSTERED_DISTRIBUTION_ENABLED.key ->
+              partiallyClustered.toString) {
+            Seq(join, leftJoin, agg).foreach(checkSPJAnswerMatchesV1)
+          }
+        }
+        withSPJConf(enabled = true) {
+          // p0 is read by several input partitions, all reporting the key p0.
+          val keys = plannedKeys(sql(join), "t_skew")
+          assert(keys.count(_ == "p0") > 1, s"Expected p0 to be split: $keys")
+          assert(keys.count(_ == "p1") == 1)
+          withSQLConf(
+              DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_FILE_SPLITTING_ENABLED.key -> "false") {
+            assert(plannedKeys(sql(join), "t_skew").sorted == Seq("p0", "p1"))
+            checkSPJAnswerMatchesV1(join)
+          }
+        }
+      }
+    }
+  }
+
+  test("Dynamic partition pruning on a scan with split partitions") {
+    withTable("t_fact", "t_dim") {
+      createStarSchema(partitionedDim = true)
+      // Small splits: each fact file is read in several byte ranges.
+      withSQLConf(
+          SQLConf.FILES_MAX_PARTITION_BYTES.key -> "8192",
+          SQLConf.FILES_MIN_PARTITION_NUM.key -> "1") {
+        withSPJConf(enabled = true) {
+          val keys = plannedKeys(sql("SELECT * FROM t_fact"), "t_fact")
+          assert(keys.size > 4, s"Expected the fact files to be split: $keys")
+        }
+        for (broadcast <- Seq(true, false)) {
+          checkDPP(starQuery.replace("<region>", "US"), broadcast, expectedFiles = Some(2))
         }
       }
     }

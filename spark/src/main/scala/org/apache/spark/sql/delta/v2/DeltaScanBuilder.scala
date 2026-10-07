@@ -195,29 +195,50 @@ class DeltaBatchScan(
   private lazy val originalPartitions: Array[InputPartition] = planPartitionsFor(selectedFiles)
 
   /**
-   * Files and input partitions left after runtime filtering (dynamic partition pruning), see
-   * [[filter]]. `None` until Spark filters the scan at runtime.
+   * Input partitions left after runtime filtering (dynamic partition pruning), see [[filter]].
+   * `None` until Spark filters the scan at runtime.
    */
-  @volatile private var runtimeFilteredFiles: Option[Seq[AddFile]] = None
   @volatile private var runtimeFilteredPartitions: Option[Array[InputPartition]] = None
 
   /**
-   * Groups `files` by projected partition key when SPJ is eligible. Otherwise files are split and
-   * packed into input partitions like the V1 file scan (see [[packFiles]]), or, with file
-   * splitting disabled, read whole in one input partition each.
+   * Plans the input partitions for `files`:
+   *  - When SPJ is eligible, files are grouped by projected partition key. Each key group is then
+   *    split and packed like the V1 file scan (see [[packFiles]]), giving one or more input
+   *    partitions that all have the group's key. Spark merges the input partitions of a key when
+   *    it needs one partition per key (e.g. for a join), or keeps them apart, for more
+   *    parallelism, when it doesn't or when `partiallyClusteredDistribution` is enabled.
+   *  - Otherwise all files are split and packed together, and no partition key is reported.
+   * With file splitting disabled, every key group (SPJ) or file (no SPJ) is one input partition,
+   * and files are read whole.
    */
   private def planPartitionsFor(files: Seq[AddFile]): Array[InputPartition] = {
-    if (isSPJEligible) {
+    val keyedGroups: Seq[(InternalRow, Seq[DeltaScanFileInfo])] = if (isSPJEligible) {
       val projectedPhysicalCols = projectedPartitionFields.map(DeltaColumnMapping.getPhysicalName)
-      val grouped = files.groupBy { f =>
+      files.groupBy { f =>
         projectedPhysicalCols.map(col => col -> f.partitionValues.getOrElse(col, null)).toMap
-      }.toSeq
-      planPartitions(grouped)
-    } else if (fileSplittingEnabled) {
-      packFiles(files)
+      }.values.toSeq.flatMap { groupFiles =>
+        val key = extractPartitionRow(groupFiles.head.partitionValues, projectedPartitionFields)
+        if (fileSplittingEnabled) {
+          packFiles(groupFiles).map(key -> _)
+        } else {
+          Seq(key -> groupFiles.map(wholeFile))
+        }
+      }
     } else {
-      planPartitions(files.map(f => (f.partitionValues, Seq(f))))
+      val noKey = new GenericInternalRow(0)
+      if (fileSplittingEnabled) {
+        packFiles(files).map(noKey -> _)
+      } else {
+        files.map(f => noKey -> Seq(wholeFile(f)))
+      }
     }
+    keyedGroups.zipWithIndex.map { case ((key, fileInfos), idx) =>
+      DeltaKeyGroupedInputPartition(
+        partitionId = idx,
+        files = fileInfos.toArray,
+        partitionKeyInternalRow = key
+      ): InputPartition
+    }.toArray
   }
 
   private def fileSplittingEnabled: Boolean = spark.sessionState.conf.getConf(
@@ -259,14 +280,22 @@ class DeltaBatchScan(
     }
   }
 
+  /** The whole file `f` as one byte range. */
+  private def wholeFile(f: AddFile): DeltaScanFileInfo = toFileInfo(
+    f,
+    partitionValues = extractPartitionRow(f.partitionValues, metadata.partitionSchema),
+    constantMetadata = TahoeFileIndex.constantMetadataForFile(f, rowIndexFilters = None),
+    start = 0L,
+    length = f.size)
+
   /**
-   * Plans the input partitions of a scan without SPJ like the V1 file scan: files are split into
-   * byte ranges, sorted by size (largest first) and packed into input partitions of up to
-   * `maxSplitBytes` with Spark's own `FilePartition.getFilePartitions` (next-fit decreasing,
-   * counting `spark.sql.files.openCostInBytes` per file, and honoring
-   * `spark.sql.files.maxPartitionNum`). Such scans report no partition key.
+   * Splits and packs `files` like the V1 file scan: files are split into byte ranges, sorted by
+   * size (largest first) and packed into groups of up to `maxSplitBytes` with Spark's own
+   * `FilePartition.getFilePartitions` (next-fit decreasing, counting
+   * `spark.sql.files.openCostInBytes` per file, and honoring `spark.sql.files.maxPartitionNum`).
+   * Returns the byte ranges of each group.
    */
-  private def packFiles(files: Seq[AddFile]): Array[InputPartition] = {
+  private def packFiles(files: Seq[AddFile]): Seq[Seq[DeltaScanFileInfo]] = {
     val splits = files.flatMap(splitFile).sortBy(_.length)(Ordering[Long].reverse)
     val infoBySplit = new java.util.IdentityHashMap[PartitionedFile, DeltaScanFileInfo]()
     val partitionedFiles = splits.map { info =>
@@ -275,12 +304,8 @@ class DeltaBatchScan(
       partitionedFile
     }
     FilePartition.getFilePartitions(spark, partitionedFiles, maxSplitBytes).map { p =>
-      DeltaKeyGroupedInputPartition(
-        partitionId = p.index,
-        files = p.files.map(infoBySplit.get),
-        partitionKeyInternalRow = new GenericInternalRow(0)
-      ): InputPartition
-    }.toArray
+      p.files.toSeq.map(infoBySplit.get)
+    }
   }
 
   /**
@@ -330,27 +355,6 @@ class DeltaBatchScan(
       partitionValues = partitionValues,
       constantMetadata = constantMetadata)
 
-  private def planPartitions(
-      groups: Seq[(Map[String, String], Seq[AddFile])]): Array[InputPartition] = {
-    groups.zipWithIndex.map { case (_, files) -> idx =>
-      val groupingKeyRow = extractPartitionRow(files.head.partitionValues, projectedPartitionFields)
-      val fileInfos = files.map { f =>
-        toFileInfo(
-          f,
-          partitionValues = extractPartitionRow(f.partitionValues, metadata.partitionSchema),
-          constantMetadata = TahoeFileIndex.constantMetadataForFile(f, rowIndexFilters = None),
-          start = 0L,
-          length = f.size)
-      }.toArray
-
-      DeltaKeyGroupedInputPartition(
-        partitionId = idx,
-        files = fileInfos,
-        partitionKeyInternalRow = groupingKeyRow
-      ): InputPartition
-    }.toArray
-  }
-
   private def resolveFilePath(child: String): String = {
     // scalastyle:off pathfromuri
     val p = new Path(new URI(child))
@@ -387,15 +391,16 @@ class DeltaBatchScan(
     projectedPartitionColumns.map(c => FieldReference.column(c): NamedReference).toArray
 
   /**
-   * Prunes the selected files with runtime predicates on partition columns (dynamic partition
-   * pruning). Spark then calls [[planInputPartitions]] again. Like V1, the predicates are
-   * evaluated on each file's partition values. Predicates that can't be translated, or that
+   * Prunes the planned input partitions with runtime predicates on partition columns (dynamic
+   * partition pruning). Spark then calls [[planInputPartitions]] again. Like V1, the predicates
+   * are evaluated on each file's partition values. Predicates that can't be translated, or that
    * reference other columns, are ignored: runtime filters only skip files, the join still
    * filters the rows.
    *
-   * The grouping keys of the remaining files are a subset of the original ones, as Spark requires
-   * for a scan that reports [[KeyGroupedPartitioning]]; Spark adds empty partitions for the
-   * missing keys. The reported partitioning and statistics are not changed.
+   * Files are removed from the input partitions they were planned in, and input partitions left
+   * without files are dropped. So for every key, the number of input partitions can only shrink,
+   * as Spark requires for a scan that reports [[KeyGroupedPartitioning]]; Spark adds empty
+   * partitions for the missing ones. The reported partitioning and statistics are not changed.
    */
   override def filter(predicates: Array[V2Predicate]): Unit = {
     val partitionAttrs = DataTypeUtils.toAttributes(metadata.partitionSchema)
@@ -411,16 +416,19 @@ class DeltaBatchScan(
     if (partitionFilters.nonEmpty) {
       val keep = Predicate.createInterpreted(
         BindReferences.bindReference(partitionFilters.reduce(And), partitionAttrs))
-      val files = runtimeFilteredFiles.getOrElse(selectedFiles)
-      val remainingFiles = files.filter { f =>
-        keep.eval(extractPartitionRow(f.partitionValues, metadata.partitionSchema))
+      val partitions = planInputPartitions().map(_.asInstanceOf[DeltaKeyGroupedInputPartition])
+      // `partitionValues` holds every partition column of the file, typed (see planPartitionsFor).
+      val remaining = partitions.flatMap { p =>
+        val files = p.files.filter(f => keep.eval(f.partitionValues))
+        if (files.isEmpty) None else Some(p.copy(files = files))
       }
+      def numFiles(ps: Array[DeltaKeyGroupedInputPartition]): Long =
+        ps.iterator.flatMap(_.files.iterator.map(_.path)).toSet.size.toLong
       logInfo(log"Runtime filtering kept " +
-        log"${MDC(DeltaLogKeys.NUM_FILES, remainingFiles.size.toLong)} of " +
-        log"${MDC(DeltaLogKeys.NUM_FILES2, files.size.toLong)} files for table " +
+        log"${MDC(DeltaLogKeys.NUM_FILES, numFiles(remaining))} of " +
+        log"${MDC(DeltaLogKeys.NUM_FILES2, numFiles(partitions))} files for table " +
         log"${MDC(DeltaLogKeys.TABLE_NAME, deltaTable.name())}")
-      runtimeFilteredFiles = Some(remainingFiles)
-      runtimeFilteredPartitions = Some(planPartitionsFor(remainingFiles))
+      runtimeFilteredPartitions = Some(remaining.map(p => p: InputPartition))
     }
   }
 
