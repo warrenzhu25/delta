@@ -203,7 +203,8 @@ class DeltaBatchScan(
       }
     }.filter(_.resolved)
 
-    snapshot.filesForScan(catalystFilters).files
+    // Keep per-file record counts when the planner uses row counts (see scanStatistics).
+    snapshot.filesForScan(catalystFilters, keepNumRecords = reportRowCount).files
   }
 
   /**
@@ -332,18 +333,36 @@ class DeltaBatchScan(
   }
 
   /**
+   * Whether to report a row count. Only the cost-based optimizer and plan statistics use it, and
+   * getting it means parsing every selected file's statistics, so it is only done when one of
+   * them is enabled.
+   */
+  private def reportRowCount: Boolean = {
+    val conf = spark.sessionState.conf
+    conf.cboEnabled || conf.planStatsEnabled
+  }
+
+  /**
    * Statistics of the selected files, used by Spark's planner (e.g. to pick broadcast joins).
    * Without them Spark assumes `spark.sql.defaultSizeInBytes` (effectively infinite).
-   * Like V1 (`HadoopFsRelation.sizeInBytes`), only the size is reported: the total size of the
-   * selected files scaled by `spark.sql.sources.fileCompressionFactor`. A row count is not
-   * reported because `filesForScan` doesn't keep per-file record counts by default.
+   * Like V1 (`HadoopFsRelation.sizeInBytes`), the size is the total size of the selected files
+   * scaled by `spark.sql.sources.fileCompressionFactor`. When [[reportRowCount]] is true and
+   * every selected file has a record count in its statistics, the row count is their sum, not
+   * counting rows deleted by Deletion Vectors (`AddFile.numLogicalRecords`).
    */
   private lazy val scanStatistics: Statistics = {
     val compressionFactor = spark.sessionState.conf.fileCompressionFactor
     val totalSize = (selectedFiles.map(_.size).sum * compressionFactor).toLong
+    val rowCount: OptionalLong = if (reportRowCount) {
+      val counts = selectedFiles.map(_.numLogicalRecords)
+      if (counts.forall(_.isDefined)) OptionalLong.of(counts.map(_.get).sum)
+      else OptionalLong.empty()
+    } else {
+      OptionalLong.empty()
+    }
     new Statistics {
       override def sizeInBytes(): OptionalLong = OptionalLong.of(totalSize)
-      override def numRows(): OptionalLong = OptionalLong.empty()
+      override def numRows(): OptionalLong = rowCount
     }
   }
 

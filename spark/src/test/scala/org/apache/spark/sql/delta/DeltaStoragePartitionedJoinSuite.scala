@@ -1451,6 +1451,51 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
     }
   }
 
+  test("V2 scan reports a row count when the cost-based optimizer is on") {
+    withTable("t_rows", "t_nostats") {
+      createDVTable("t_rows")
+      insertValues("t_rows", (1 to 10).map(i => s"($i, 'v$i', 'p${i % 2}')").mkString(", "))
+      def numRows(query: String): Option[Long] = {
+        val df = sql(query)
+        val stats = batchScans(df.queryExecution.executedPlan).head.scan
+          .asInstanceOf[DeltaBatchScan].estimateStatistics().numRows()
+        val rows = if (stats.isPresent) Some(stats.getAsLong) else None
+        // The optimizer uses the same value.
+        assert(df.queryExecution.optimizedPlan.collectLeaves().head.stats.rowCount ==
+          rows.map(BigInt(_)))
+        rows
+      }
+      val all = "SELECT * FROM t_rows"
+      withSPJConf(enabled = true) {
+        withSQLConf(SQLConf.CBO_ENABLED.key -> "true") {
+          assert(numRows(all) == Some(10))
+          assert(numRows(all + " WHERE part = 'p0'") == Some(5))
+          // Rows deleted by a Deletion Vector are not counted.
+          sql("DELETE FROM t_rows WHERE id IN (2, 3)")
+          assert(numFilesWithDVs("t_rows") == 2)
+          assert(numRows(all) == Some(8))
+          assert(numRows(all + " WHERE part = 'p0'") == Some(4))
+        }
+        withSQLConf(SQLConf.PLAN_STATS_ENABLED.key -> "true") {
+          assert(numRows(all) == Some(8))
+        }
+        // Only the size without CBO, like V1.
+        assert(numRows(all).isEmpty)
+
+        // No row count when a selected file has no record count.
+        sql("CREATE TABLE t_nostats (id INT, part STRING) USING delta PARTITIONED BY (part)")
+        insertValues("t_nostats", "(1, 'p0'), (2, 'p1')")
+        withSQLConf(DeltaSQLConf.DELTA_COLLECT_STATS.key -> "false") {
+          insertValues("t_nostats", "(3, 'p1')")
+        }
+        withSQLConf(SQLConf.CBO_ENABLED.key -> "true") {
+          assert(numRows("SELECT * FROM t_nostats WHERE part = 'p0'") == Some(1))
+          assert(numRows("SELECT * FROM t_nostats").isEmpty)
+        }
+      }
+    }
+  }
+
   test("SPJ with Delta Column Mapping (name mode)") {
     withTable("t_cm1", "t_cm2") {
       sql("CREATE TABLE t_cm1 (id INT, part STRING) USING delta PARTITIONED BY (part) " +

@@ -110,7 +110,7 @@ have to sort its partitions.
 | `spark/src/main/scala/org/apache/spark/sql/delta/DeltaAnalysis.scala` | V2 → V1 conversion keeps `_metadata` references valid (6.6.5) | +93 / -7 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/files/TahoeFileIndex.scala` | Per-file constant metadata (row tracking, DV descriptor) moved into a reusable `TahoeFileIndex.constantMetadataForFile` | +30 / -17 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/v2/DeltaScanBuilder.scala` | **New.** Scan builder, scan (with statistics and runtime filtering), input partition, reader factory (with `_metadata`), reader (with DV filtering), columnar reader, file packing and splitting (also within SPJ key groups), scan metrics | ~1020 |
-| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 63 tests | ~1490 |
+| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 64 tests | ~1535 |
 
 No other code paths change when the conf is `false`. The only extra work is two conf lookups per
 Delta relation during analysis (plus two more when Spark asks a Delta table for its metadata
@@ -532,12 +532,26 @@ private lazy val reportedPartitioning: Partitioning =
 #### 6.4.6a Reporting statistics
 
 ```scala
+// selectedFiles (6.4.3) asks for record counts only when they are used:
+//   snapshot.filesForScan(catalystFilters, keepNumRecords = reportRowCount).files
+private def reportRowCount: Boolean = {
+  val conf = spark.sessionState.conf
+  conf.cboEnabled || conf.planStatsEnabled
+}
+
 private lazy val scanStatistics: Statistics = {
   val compressionFactor = spark.sessionState.conf.fileCompressionFactor
   val totalSize = (selectedFiles.map(_.size).sum * compressionFactor).toLong
+  val rowCount: OptionalLong = if (reportRowCount) {
+    val counts = selectedFiles.map(_.numLogicalRecords)
+    if (counts.forall(_.isDefined)) OptionalLong.of(counts.map(_.get).sum)
+    else OptionalLong.empty()
+  } else {
+    OptionalLong.empty()
+  }
   new Statistics {
     override def sizeInBytes(): OptionalLong = OptionalLong.of(totalSize)
-    override def numRows(): OptionalLong = OptionalLong.empty()
+    override def numRows(): OptionalLong = rowCount
   }
 }
 
@@ -552,9 +566,18 @@ override def estimateStatistics(): Statistics = scanStatistics
   fix.
 - **Size:** total size of the *selected* (pruned) files times `fileCompressionFactor`, matching
   V1's `HadoopFsRelation.sizeInBytes`. Spark's planner further scales it down for column pruning.
-- **No row count**, like V1. `filesForScan` drops per-file stats unless called with
-  `keepNumRecords = true`, which would parse every file's stats JSON even for unfiltered scans.
-  That is a possible follow-up if CBO row counts are wanted.
+- **Row count only with CBO.** Only the cost-based optimizer (`spark.sql.cbo.enabled`) and plan
+  statistics (`spark.sql.cbo.planStats.enabled`) use row counts, for join reordering and
+  cardinality estimates. Getting it means `filesForScan(..., keepNumRecords = true)`, which
+  parses every selected file's stats JSON even for unfiltered scans, so it is only done when one
+  of them is on. Otherwise only the size is reported, like V1.
+- **Value.** The sum of `AddFile.numLogicalRecords` over the selected files: the `numRecords`
+  stat minus the rows deleted by the file's DV, so it is the number of rows the scan returns
+  when there are no data filters. With a partition filter it covers the selected partitions
+  only. With data filters it counts every row of the files kept by data skipping, an upper
+  bound, as for any file-level estimate. If any selected file has no `numRecords` stat (for
+  example written with `spark.databricks.delta.stats.collect=false`), no row count is reported
+  rather than a wrong one.
 - The local name `totalSize` must differ from the interface method `sizeInBytes`; otherwise the
   anonymous class's method would call itself.
 
@@ -1596,7 +1619,7 @@ row tracking formula as V1 (6.6), and every `_metadata` test compares V2 output 
 
 ## 10. Test Suite
 
-`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 63
+`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 64
 tests.
 
 **Setup (`withSPJConf`):** turns on both SPJ confs, `pushPartValues=true`,
@@ -1672,8 +1695,9 @@ deterministic.
 | 59 | Scans return rows when columnar batches can't be used | Vectorized reader off, whole-stage codegen off, too many fields, and the kill switch each give rows and equal V1; `_metadata` reads are row-based; a DV table is columnar until a DELETE writes a DV (6.9.1 b). |
 | 60 | V2 scan reports file metrics like V1 | `numFiles`, `filesSize`, `numPartitions` equal V1's for an SPJ join, a join with a partition filter, and a scan without SPJ; exact values (6 files, table size, 3 partitions); split files count once (6.10). |
 | 61 | V2 scan metrics after dynamic partition pruning and with Deletion Vectors | After DPP the fact scan reports 2 files and 2 partitions (6.10 a); `numDeletedRowsSkipped` counts the 2 rows removed by a DV (6.10 d). |
-| 62 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
-| 63 | SPJ with tables containing NULL partition values | NULL keys. |
+| 62 | V2 scan reports a row count when the cost-based optimizer is on | With CBO: 10 rows, 5 with a partition filter, 8 / 4 after a DELETE writes DVs; the optimized plan uses the same value; with plan statistics on as well; no row count without CBO, or when a selected file has no `numRecords` stat (6.4.6a). |
+| 63 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
+| 64 | SPJ with tables containing NULL partition values | NULL keys. |
 
 The `_metadata` tests use `checkMatchesV1(query, expectV2)`: it runs the query with the feature
 off and on, checks the rows are equal, and checks whether the plan with the feature on has a V2
@@ -1736,4 +1760,5 @@ Changes made while preparing the PR, and why:
 | Split large key groups for SPJ scans (6.8.2) | **Skew.** With SPJ each key was one task reading whole files, so one large partition made one long task. Spark 4.2 accepts several input partitions per key and can spread them with partially clustered distribution. DPP now removes files from the planned splits so the number of splits per key never grows. |
 | Columnar reads (6.9) | **Performance regression.** V1 hands Parquet batches to whole-stage codegen; the V2 scan turned them into rows and projected each one. Uses V1's rule for when to return batches, and only reorders the batch's column vectors. Most existing tests now run columnar, so they cover it too. |
 | Scan metrics (6.10) | **Observability regression.** V1 shows files, bytes and partitions read; the V2 `BatchScan` only showed output rows. Same names and descriptions as V1, plus rows skipped by DVs. |
+| Row count with CBO (6.4.6a) | **Planning quality.** With CBO on, a scan without a row count gets poor cardinality estimates and join reordering. Delta's stats already have `numRecords`; the count is only computed when CBO or plan statistics are on, and is DV-aware. |
 | Test cleanup and new tests 6–10, 15 | Line length and style, plus coverage for type parsing, column order, time travel, DML, and the conf guard. |
