@@ -28,6 +28,7 @@ import org.apache.spark.sql.delta.commands.DeletionVectorUtils
 import org.apache.spark.sql.delta.files.TahoeFileIndex
 import org.apache.spark.sql.delta.logging.DeltaLogKeys
 import org.apache.spark.sql.delta.metering.DeltaLogging
+import org.apache.spark.sql.delta.schema.SchemaUtils
 import org.apache.spark.sql.delta.sources.{DeltaSourceUtils, DeltaSQLConf}
 import org.apache.hadoop.fs.Path
 
@@ -121,9 +122,45 @@ class DeltaBatchScan(
   override def columnarSupportMode(): Scan.ColumnarSupportMode =
     Scan.ColumnarSupportMode.UNSUPPORTED
 
-  private val snapshot: Snapshot = deltaTable.initialSnapshot
+  /**
+   * The active transaction on this table, if any. Like V1 (`PrepareDeltaScan`), a read of the
+   * table that a transaction is writing (e.g. the target of a MERGE, or a DELETE/UPDATE
+   * subquery) uses the transaction's snapshot and records the files and predicates it reads, so
+   * that conflict detection sees them. Time-travel reads keep their pinned snapshot.
+   */
+  private val activeTxn: Option[OptimisticTransaction] =
+    if (deltaTable.timeTravelSpec.isDefined) {
+      None
+    } else {
+      OptimisticTransaction.getActive().filter(_.deltaLog.isSameLogAs(deltaTable.deltaLog))
+    }
+
+  private val snapshot: Snapshot = activeTxn match {
+    case Some(txn) =>
+      checkSchemaOnRead(
+        analysisSnapshot = deltaTable.initialSnapshot, snapshotToScan = txn.snapshot)
+      txn.snapshot
+    case None => deltaTable.initialSnapshot
+  }
   private val protocol: Protocol = snapshot.protocol
   private val metadata: Metadata = snapshot.metadata
+
+  /**
+   * Like V1 (`TahoeFileIndex.getSnapshot`), fail if the schema of the snapshot to scan is not
+   * read compatible with the schema used at analysis time, or if column mapping physical names
+   * changed.
+   */
+  private def checkSchemaOnRead(analysisSnapshot: Snapshot, snapshotToScan: Snapshot): Unit = {
+    if (snapshotToScan.version != analysisSnapshot.version &&
+        spark.sessionState.conf.getConf(DeltaSQLConf.DELTA_SCHEMA_ON_READ_CHECK_ENABLED)) {
+      val snapshotSchema = snapshotToScan.metadata.schema
+      if (!SchemaUtils.isReadCompatible(analysisSnapshot.schema, snapshotSchema) ||
+          !DeltaColumnMapping.hasNoColumnMappingSchemaChanges(
+            snapshotToScan.metadata, analysisSnapshot.metadata)) {
+        throw DeltaErrors.schemaChangedSinceAnalysis(analysisSnapshot.schema, snapshotSchema)
+      }
+    }
+  }
 
   // scalastyle:off caselocale
   private lazy val readFieldNamesLower: Set[String] =
@@ -180,7 +217,10 @@ class DeltaBatchScan(
       }
     }.filter(_.resolved)
 
-    snapshot.filesForScan(catalystFilters).files
+    // Inside a transaction on this table, list files through the transaction so that the read
+    // files and predicates are tracked for conflict detection.
+    activeTxn.map(_.filesForScan(catalystFilters).files)
+      .getOrElse(snapshot.filesForScan(catalystFilters).files)
   }
 
   /**
