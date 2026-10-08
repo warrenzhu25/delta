@@ -106,11 +106,11 @@ have to sort its partitions.
 | :--- | :--- | :--- |
 | `spark/src/main/scala/org/apache/spark/sql/delta/sources/DeltaSQLConf.scala` | New confs `storagePartitionedJoin.enabled` and (internal) `storagePartitionedJoin.deletionVectors.enabled`, `storagePartitionedJoin.fileSplitting.enabled`, `storagePartitionedJoin.columnarReads.enabled` | +39 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/FallbackToV1Relations.scala` | Keep V2 relation when the table qualifies; table-level check shared with `DeltaTableV2.metadataColumns` | +43 / -2 |
-| `spark/src/main/scala/org/apache/spark/sql/delta/catalog/DeltaTableV2.scala` | `with SupportsRead`, `newScanBuilder`; `with SupportsMetadataColumns`, `metadataColumns` (6.6.1) | +30 / -2 |
+| `spark/src/main/scala/org/apache/spark/sql/delta/catalog/DeltaTableV2.scala` | `with SupportsRead`, `newScanBuilder`; `with SupportsMetadataColumns`, `metadataColumns` (6.6.1); `timeTravelSpec` is `private[delta]` | +31 / -3 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/DeltaAnalysis.scala` | V2 → V1 conversion keeps `_metadata` references valid (6.6.5) | +93 / -7 |
 | `spark/src/main/scala/org/apache/spark/sql/delta/files/TahoeFileIndex.scala` | Per-file constant metadata (row tracking, DV descriptor) moved into a reusable `TahoeFileIndex.constantMetadataForFile` | +30 / -17 |
-| `spark/src/main/scala/org/apache/spark/sql/delta/v2/DeltaScanBuilder.scala` | **New.** Scan builder, scan (with statistics and runtime filtering), input partition, reader factory (with `_metadata`), reader (with DV filtering), columnar reader, file packing and splitting (also within SPJ key groups), scan metrics | ~1020 |
-| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 64 tests | ~1535 |
+| `spark/src/main/scala/org/apache/spark/sql/delta/v2/DeltaScanBuilder.scala` | **New.** Scan builder, scan (with statistics, runtime filtering and transaction-aware reads), input partition, reader factory (with `_metadata`), reader (with DV filtering), columnar reader, file packing and splitting (also within SPJ key groups), scan metrics | ~1080 |
+| `spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` | **New.** 67 tests | ~1600 |
 
 No other code paths change when the conf is `false`. The only extra work is two conf lookups per
 Delta relation during analysis (plus two more when Spark asks a Delta table for its metadata
@@ -286,6 +286,8 @@ doesn't match, so the `DataSourceV2Relation` stays in the plan.
   the separate `DeltaRelation` extractor, which ignores this flag. A partitioned Delta table used
   as a MERGE source or in `INSERT ... SELECT` may be read through the V2 scan. (DELETE and UPDATE
   additionally fix up `_metadata` references during that conversion, see 6.6.5.)
+  When that table is also the command's target, the scan reads through the active
+  transaction (6.4.2).
 
 ### 6.3 `DeltaTableV2.scala`: `SupportsRead`
 
@@ -304,7 +306,8 @@ override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
 
 - `BATCH_READ` was already in `capabilities()`. Before, nothing used it because the relation was
   always replaced by V1.
-- `this` is passed so the scan uses `this.initialSnapshot`. That snapshot already reflects time
+- `this` is passed so the scan uses `this.initialSnapshot` (or, inside a transaction on the same
+  table, the transaction's snapshot; see 6.4.2). That snapshot already reflects time
   travel (`VERSION AS OF` / the `versionAsOf` option), because the catalog builds `DeltaTableV2`
   with `timeTravelOpt` set.
 - `tableSchema` is the user-facing logical schema (column-mapping logical names, internal metadata
@@ -364,7 +367,16 @@ class DeltaBatchScan(val spark, val deltaTable, val tableSchema, val readSchema,
   override def columnarSupportMode() =                    // batches when V1 would return them, 6.9
     if (columnarReads) Scan.ColumnarSupportMode.SUPPORTED else Scan.ColumnarSupportMode.UNSUPPORTED
 
-  private val snapshot = deltaTable.initialSnapshot
+  private val activeTxn: Option[OptimisticTransaction] =
+    if (deltaTable.timeTravelSpec.isDefined) None
+    else OptimisticTransaction.getActive().filter(_.deltaLog.isSameLogAs(deltaTable.deltaLog))
+
+  private val snapshot = activeTxn match {
+    case Some(txn) =>
+      checkSchemaOnRead(analysisSnapshot = deltaTable.initialSnapshot, snapshotToScan = txn.snapshot)
+      txn.snapshot
+    case None => deltaTable.initialSnapshot
+  }
   private val protocol = snapshot.protocol
   private val metadata = snapshot.metadata
 
@@ -381,6 +393,22 @@ class DeltaBatchScan(val spark, val deltaTable, val tableSchema, val readSchema,
       spark.sessionState.conf.getConf(DeltaSQLConf.DELTA_STORAGE_PARTITIONED_JOIN_ENABLED)
 ```
 
+- **Snapshot selection** follows V1 (`PrepareDeltaScan.getDeltaScanGenerator`):
+  1. A time-travel read uses the snapshot pinned at analysis (`initialSnapshot`).
+  2. Otherwise, if an `OptimisticTransaction` is active on the *same* Delta log, the scan uses the
+     transaction's snapshot. This is the case when a command reads the table it writes, for
+     example a MERGE whose source reads the target table, or a DELETE/UPDATE with a subquery on the
+     target. The scan is built during optimization, which these commands run inside the
+     transaction. File listing then goes through the transaction (6.4.3 (b)).
+  3. Otherwise the scan uses `initialSnapshot`.
+- **`checkSchemaOnRead`:** when the transaction's snapshot is at a different version than the
+  analysis snapshot, the scan runs the same check as V1 (`TahoeFileIndex.getSnapshot`, controlled
+  by `spark.databricks.delta.checkLatestSchemaOnRead`). It throws
+  `DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS` if the schemas are not read compatible or column-mapping
+  physical names changed. Without it, the scan could read files with physical names that the
+  analyzed plan doesn't know.
+- `DeltaTableV2.timeTravelSpec` was `private`. It is now `private[delta]` so the scan can tell a
+  time-travel read (`VERSION AS OF`, the `versionAsOf` option, or `@v` in the path) apart.
 - **`projectedPartitionFields`:** the table's partition columns that are also in `readSchema`,
   kept in partition-schema order. Using only *projected* columns matters; see 7.1.
 - The column names are **logical** names (what the query and `readSchema` use). Physical names are
@@ -400,8 +428,10 @@ private lazy val selectedFiles: Seq[AddFile] = {
     expr.transform { case u: UnresolvedAttribute => attrMap.getOrElse(u.name, u) }
   }.filter(_.resolved)
 
-  // (b) Delta log pruning: partition pruning + data skipping
-  snapshot.filesForScan(catalystFilters).files
+  // (b) Delta log pruning: partition pruning + data skipping. Inside a transaction on this
+  //     table, go through the transaction so the read files and predicates are tracked.
+  activeTxn.map(_.filesForScan(catalystFilters, keepNumRecords = reportRowCount).files)
+    .getOrElse(snapshot.filesForScan(catalystFilters, keepNumRecords = reportRowCount).files)
 }
 
 // Used by the reader factory to decide whether DV filtering is needed (6.5)
@@ -440,7 +470,13 @@ private def planPartitionsFor(files: Seq[AddFile]): Array[InputPartition] = {
   re-applies every filter after the scan.
 - **(b)** `Snapshot.filesForScan` is the same API the V1 path uses (through `TahoeLogFileIndex`).
   It does partition pruning and min/max data skipping. That is why the `WHERE part = 'p2'` test
-  ends up with exactly one input partition per side.
+  ends up with exactly one input partition per side. `OptimisticTransaction.filesForScan` calls
+  the same method on the transaction's snapshot, and also records the filters
+  (`trackReadPredicates`) and the returned files (`trackFilesRead`). At commit, the conflict
+  checker uses them to detect concurrent commits that removed a file the transaction read
+  (`ConcurrentDeleteReadException`) or added a file matching a read predicate
+  (`ConcurrentAppendException`). Without this, a MERGE or DELETE that reads its own target through
+  the V2 scan could commit over a conflicting change.
 - **(c)** The grouping key is a map of physical column name to raw string value, built from the
   *projected* partition columns only. Files from different full partitions (`US/CA`, `US/NY`)
   share a group when only `region` is projected. Each group is then split and packed like V1
@@ -532,7 +568,8 @@ private lazy val reportedPartitioning: Partitioning =
 #### 6.4.6a Reporting statistics
 
 ```scala
-// selectedFiles (6.4.3) asks for record counts only when they are used:
+// selectedFiles (6.4.3) asks for record counts only when they are used (through the active
+// transaction, if any):
 //   snapshot.filesForScan(catalystFilters, keepNumRecords = reportRowCount).files
 private def reportRowCount: Boolean = {
   val conf = spark.sessionState.conf
@@ -1619,7 +1656,7 @@ row tracking formula as V1 (6.6), and every `_metadata` test compares V2 output 
 
 ## 10. Test Suite
 
-`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 64
+`spark/src/test/scala/org/apache/spark/sql/delta/DeltaStoragePartitionedJoinSuite.scala` has 67
 tests.
 
 **Setup (`withSPJConf`):** turns on both SPJ confs, `pushPartValues=true`,
@@ -1696,8 +1733,11 @@ deterministic.
 | 60 | V2 scan reports file metrics like V1 | `numFiles`, `filesSize`, `numPartitions` equal V1's for an SPJ join, a join with a partition filter, and a scan without SPJ; exact values (6 files, table size, 3 partitions); split files count once (6.10). |
 | 61 | V2 scan metrics after dynamic partition pruning and with Deletion Vectors | After DPP the fact scan reports 2 files and 2 partitions (6.10 a); `numDeletedRowsSkipped` counts the 2 rows removed by a DV (6.10 d). |
 | 62 | V2 scan reports a row count when the cost-based optimizer is on | With CBO: 10 rows, 5 with a partition filter, 8 / 4 after a DELETE writes DVs; the optimized plan uses the same value; with plan statistics on as well; no row count without CBO, or when a selected file has no `numRecords` stat (6.4.6a). |
-| 63 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
-| 64 | SPJ with tables containing NULL partition values | NULL keys. |
+| 63 | Reads inside an active transaction use the transaction's snapshot | A commit made after the transaction started is not visible inside it; time travel inside the transaction still reads the requested version (6.4.2). |
+| 64 | Reads inside an active transaction are tracked for conflict detection | A concurrent DELETE of a file the transaction read through the V2 scan fails the commit with `ConcurrentDeleteReadException` (6.4.3 (b)). |
+| 65 | Reads inside an active transaction fail if the schema changed since analysis | A column renamed (column mapping) after the transaction started throws `DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS` (6.4.2). |
+| 66 | SPJ with Delta Column Mapping (name mode) | Physical-name lookup. |
+| 67 | SPJ with tables containing NULL partition values | NULL keys. |
 
 The `_metadata` tests use `checkMatchesV1(query, expectV2)`: it runs the query with the feature
 off and on, checks the rows are equal, and checks whether the plan with the feature on has a V2
@@ -1761,4 +1801,5 @@ Changes made while preparing the PR, and why:
 | Columnar reads (6.9) | **Performance regression.** V1 hands Parquet batches to whole-stage codegen; the V2 scan turned them into rows and projected each one. Uses V1's rule for when to return batches, and only reorders the batch's column vectors. Most existing tests now run columnar, so they cover it too. |
 | Scan metrics (6.10) | **Observability regression.** V1 shows files, bytes and partitions read; the V2 `BatchScan` only showed output rows. Same names and descriptions as V1, plus rows skipped by DVs. |
 | Row count with CBO (6.4.6a) | **Planning quality.** With CBO on, a scan without a row count gets poor cardinality estimates and join reordering. Delta's stats already have `numRecords`; the count is only computed when CBO or plan statistics are on, and is DV-aware. |
+| Read through the active transaction (6.4.2, 6.4.3 b) | **Correctness bug.** The scan always read `initialSnapshot` and listed files with `Snapshot.filesForScan`. Inside a transaction on the same table (MERGE reading its target, DELETE/UPDATE subqueries) it read a different snapshot than the transaction and didn't record read files or predicates, so concurrent conflicting commits went undetected. V1 (`PrepareDeltaScan`) uses the transaction. Tests 63–65. |
 | Test cleanup and new tests 6–10, 15 | Line length and style, plus coverage for type parsing, column order, time travel, DML, and the conf guard. |

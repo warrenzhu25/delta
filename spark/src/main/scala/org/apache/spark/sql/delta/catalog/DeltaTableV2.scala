@@ -161,7 +161,7 @@ class DeltaTableV2 private(
     .orElse(tableIdentifier)
     .getOrElse(s"delta.`${deltaLog.dataPath}`")
 
-  private lazy val timeTravelSpec: Option[DeltaTimeTravelSpec] = {
+  private[delta] lazy val timeTravelSpec: Option[DeltaTimeTravelSpec] = {
     if (timeTravelOpt.isDefined && timeTravelByPath.isDefined) {
       throw DeltaErrors.multipleTimeTravelSyntaxUsed
     }
