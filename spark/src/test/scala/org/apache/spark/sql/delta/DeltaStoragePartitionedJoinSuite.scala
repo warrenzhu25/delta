@@ -18,6 +18,7 @@ package org.apache.spark.sql.delta
 
 import java.sql.Date
 
+import org.apache.spark.sql.delta.actions.AddFile
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
 import org.apache.spark.sql.delta.v2.DeltaBatchScan
@@ -753,6 +754,72 @@ class DeltaStoragePartitionedJoinSuite extends QueryTest
           checkAnswer(query, Seq((1, 10, "p1"), (3, 30, "p2")).toDF("id1", "id2", "part"))
           // Only the DV-free table is read through the V2 scan.
           assert(batchScans(query.queryExecution.executedPlan).size == 1)
+        }
+      }
+    }
+  }
+
+  test("Reads inside an active transaction use the transaction's snapshot") {
+    withTable("t_txn") {
+      sql("CREATE TABLE t_txn (id INT, part STRING) USING delta PARTITIONED BY (part)")
+      sql("INSERT INTO t_txn VALUES (1, 'a')")
+      val deltaLog = DeltaLog.forTable(spark, TableIdentifier("t_txn"))
+      val txn = deltaLog.startTransaction()
+      // Committed after the transaction started: not visible to reads inside the transaction.
+      sql("INSERT INTO t_txn VALUES (2, 'b')")
+
+      withSPJConf(enabled = true) {
+        OptimisticTransaction.withActive(txn) {
+          val df = spark.table("t_txn")
+          checkAnswer(df, Seq(Row(1, "a")))
+          assert(batchScans(df.queryExecution.executedPlan).nonEmpty)
+          // Time travel keeps the requested version.
+          checkAnswer(spark.read.option("versionAsOf", "2").table("t_txn"),
+            Seq(Row(1, "a"), Row(2, "b")))
+        }
+        checkAnswer(spark.table("t_txn"), Seq(Row(1, "a"), Row(2, "b")))
+      }
+    }
+  }
+
+  test("Reads inside an active transaction are tracked for conflict detection") {
+    withTable("t_txn") {
+      sql("CREATE TABLE t_txn (id INT, part STRING) USING delta PARTITIONED BY (part)")
+      sql("INSERT INTO t_txn VALUES (1, 'a'), (2, 'b')")
+      val deltaLog = DeltaLog.forTable(spark, TableIdentifier("t_txn"))
+      val txn = deltaLog.startTransaction()
+
+      withSPJConf(enabled = true) {
+        OptimisticTransaction.withActive(txn) {
+          val df = spark.table("t_txn").where("part = 'a'")
+          checkAnswer(df, Seq(Row(1, "a")))
+          assert(batchScans(df.queryExecution.executedPlan).nonEmpty)
+        }
+      }
+      // A concurrent commit removes the file that the transaction read.
+      sql("DELETE FROM t_txn WHERE part = 'a'")
+      val newFile = AddFile("new.parquet", Map("part" -> "b"), 1L, 1L, dataChange = true)
+      intercept[ConcurrentDeleteReadException] {
+        txn.commit(Seq(newFile), DeltaOperations.ManualUpdate)
+      }
+    }
+  }
+
+  test("Reads inside an active transaction fail if the schema changed since analysis") {
+    withTable("t_txn") {
+      sql("CREATE TABLE t_txn (id INT, part STRING) USING delta PARTITIONED BY (part) " +
+        "TBLPROPERTIES ('delta.columnMapping.mode' = 'name')")
+      sql("INSERT INTO t_txn VALUES (1, 'a')")
+      val deltaLog = DeltaLog.forTable(spark, TableIdentifier("t_txn"))
+      val txn = deltaLog.startTransaction()
+      sql("ALTER TABLE t_txn RENAME COLUMN id TO id2")
+
+      withSPJConf(enabled = true) {
+        OptimisticTransaction.withActive(txn) {
+          val e = intercept[DeltaAnalysisException] {
+            spark.table("t_txn").collect()
+          }
+          assert(e.getCondition == "DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS")
         }
       }
     }
